@@ -1,0 +1,51 @@
+{
+  "$schema": "https://raw.githubusercontent.com/platformio/platformio-core/develop/platformio/assets/schema/library.json",
+  "name": "SignalCore",
+  "version": "0.1.0",
+  "description": "Cross-platform digital signal processing toolkit for Arduino: FFT, DDS signal generation, window functions, edge trigger, peak-hold, and exponential moving average. CMSIS-DSP accelerated on Teensy 4.x with a portable C++ fallback elsewhere.",
+  "keywords": [
+    "arduino",
+    "dsp",
+    "fft",
+    "dds",
+    "signal-generator",
+    "trigger",
+    "moving-average",
+    "peak-hold",
+    "windowing",
+    "cmsis"
+  ],
+  "homepage": "https://docs.voidloop.com/libraries/signalcore/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/voidloopers/SignalCore"
+  },
+  "authors": [
+    {
+      "name": "Zachariah Magee",
+      "url": "https://github.com/voidloopers/SignalCore",
+      "maintainer": true
+    }
+  ],
+  "frameworks": [
+    "arduino"
+  ],
+  "platforms": "*",
+  "headers": [
+    "SignalCore.h"
+  ],
+  "examples": "examples",
+  "export": {
+    "exclude": [
+      ".DS_Store",
+      ".git",
+      ".pio",
+      ".vscode",
+      "dev",
+      "notes",
+      "releases",
+      "skills",
+      "*.zip"
+    ]
+  }
+}

@@ -1,0 +1,458 @@
+/******************************************************************************
+ * @file FFT.h
+ * @brief Cross-Platform FFT and Spectral Analysis
+ *
+ * Provides a template-based FFT class and spectral analysis helpers. On ARM
+ * platforms with CMSIS-DSP (Teensy 4.x by default, other ARM cores when
+ * SIGNALCORE_FORCE_CMSIS is defined), uses hardware-accelerated
+ * arm_rfft_fast_f32. On all other platforms, uses a portable radix-2
+ * Cooley-Tukey implementation that produces identical output packing.
+ *
+ * Output format (matches CMSIS arm_rfft_fast_f32 packing):
+ *   result[0]       = DC bin (real, magnitude)
+ *   result[1]       = Nyquist bin (real, magnitude)  -- before post-processing
+ *   result[2..N-1]  = complex pairs [re, im] for bins 1..(N/2 - 1)
+ *
+ * After forward(), result[0..N/2] contains scaled magnitudes.
+ *
+ * Platform: Any Arduino-compatible board
+ *
+ *   This file is a part of the SignalCore project, a cross-platform digital
+ *   signal processing toolkit released by VoidLoop. See www.voidloop.com for
+ *   updates.
+ *
+ * Contributors:
+ * Initial vision, feature definition, debugging and funding: Greg Kovacs
+ * Architecture, Development, debugging and support: Zachariah Magee
+ *
+ * MIT License (MIT)
+ *
+ * Copyright (c) 2026 VoidLoop
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ ******************************************************************************/
+
+#ifndef _SIGNALCORE_FFT_H_
+#define _SIGNALCORE_FFT_H_
+
+#include <Arduino.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+#include <float.h>
+#include <stdint.h>
+
+#include "Platform.h"
+#include "Windows.h"
+
+
+namespace signalcore {
+
+// Named FFT sizes. This is an *unscoped* enum on purpose: the values implicitly
+// convert to an integer, so FFT<FFTSize::N512> and FFT<512> name the same type,
+// and a plain integer (e.g. a FFT_LENGTH macro) can drive both the template
+// argument and an array declaration from a single source of truth.
+enum FFTSize : uint16_t {
+    N32   = 32,
+    N64   = 64,
+    N128  = 128,
+    N256  = 256,
+    N512  = 512,
+    N1024 = 1024,
+    N2048 = 2048,
+    N4096 = 4096
+};
+
+
+// --- Backend selection: types and function bindings ---
+
+namespace detail {
+
+#if defined(SIGNALCORE_USE_CMSIS)
+
+} // namespace detail
+} // namespace signalcore
+
+#include "arm_math.h"
+#include "arm_const_structs.h"
+
+namespace signalcore {
+namespace detail {
+
+    typedef arm_rfft_fast_instance_f32 RFFTInstanceF32;
+
+    inline void rfftFastInitF32(RFFTInstanceF32* S, uint16_t fftLen) {
+        arm_rfft_fast_init_f32(S, fftLen);
+    }
+    inline void rfftFastF32(RFFTInstanceF32* S, float* pSrc, float* pDst, uint8_t ifftFlag) {
+        arm_rfft_fast_f32(S, pSrc, pDst, ifftFlag);
+    }
+    inline void cmplxMagF32(float* pSrc, float* pDst, uint32_t numSamples) {
+        arm_cmplx_mag_f32(pSrc, pDst, numSamples);
+    }
+
+#else  // Generic C++ backend
+
+    struct RFFTInstanceF32 {
+        uint16_t fftLen;
+    };
+
+    // In-place radix-2 Cooley-Tukey complex FFT.
+    // data[] is interleaved complex: [re0, im0, re1, im1, ...], length = 2*N.
+    // N must be a power of 2.
+    inline void genericComplexFFT(float* data, int N) {
+        // Bit-reversal permutation
+        for (int i = 1, j = 0; i < N; i++) {
+            int bit = N >> 1;
+            while (j & bit) {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j ^= bit;
+            if (i < j) {
+                float t;
+                t = data[2 * i];     data[2 * i]     = data[2 * j];     data[2 * j]     = t;
+                t = data[2 * i + 1]; data[2 * i + 1] = data[2 * j + 1]; data[2 * j + 1] = t;
+            }
+        }
+
+        // Butterfly stages
+        for (int len = 2; len <= N; len <<= 1) {
+            float angle = -2.0f * (float)M_PI / len;
+            float wrStep = cosf(angle);
+            float wiStep = sinf(angle);
+
+            for (int i = 0; i < N; i += len) {
+                float wr = 1.0f, wi = 0.0f;
+                for (int j = 0; j < len / 2; j++) {
+                    int u = 2 * (i + j);
+                    int v = 2 * (i + j + len / 2);
+
+                    float tr = wr * data[v] - wi * data[v + 1];
+                    float ti = wr * data[v + 1] + wi * data[v];
+
+                    data[v]     = data[u]     - tr;
+                    data[v + 1] = data[u + 1] - ti;
+                    data[u]     += tr;
+                    data[u + 1] += ti;
+
+                    float newWr = wr * wrStep - wi * wiStep;
+                    wi = wr * wiStep + wi * wrStep;
+                    wr = newWr;
+                }
+            }
+        }
+    }
+
+    inline void rfftFastInitF32(RFFTInstanceF32* S, uint16_t fftLen) {
+        S->fftLen = fftLen;
+    }
+
+    // Real FFT of N samples using an N/2-point complex FFT. Output is packed
+    // in CMSIS arm_rfft_fast_f32 format. The input buffer (pSrc) is consumed
+    // and its contents are undefined after the call — use separate input and
+    // output buffers.
+    inline void rfftFastF32(RFFTInstanceF32* S, float* pSrc, float* pDst, uint8_t /*ifftFlag*/) {
+        int N = S->fftLen;
+        int M = N / 2;
+
+        memcpy(pDst, pSrc, N * sizeof(float));
+        genericComplexFFT(pDst, M);
+
+        float z0r = pDst[0];
+        float z0i = pDst[1];
+
+        // DC and Nyquist bins (both purely real for real input)
+        pDst[0] = z0r + z0i;
+        pDst[1] = z0r - z0i;
+
+        // Process conjugate-symmetric pairs: k and M-k share trig values
+        for (int k = 1; k < (M + 1) / 2; k++) {
+            int mk = M - k;
+
+            float zrk  = pDst[2 * k];
+            float zik  = pDst[2 * k + 1];
+            float zrmk = pDst[2 * mk];
+            float zimk = pDst[2 * mk + 1];
+
+            float er  =  0.5f * (zrk + zrmk);
+            float ei  =  0.5f * (zik - zimk);
+            float orC =  0.5f * (zik + zimk);
+            float oi  =  0.5f * (zrmk - zrk);
+
+            float angle = 2.0f * (float)M_PI * k / N;
+            float c = cosf(angle);
+            float s = sinf(angle);
+
+            pDst[2 * k]      = er + c * orC + s * oi;
+            pDst[2 * k + 1]  = ei + c * oi  - s * orC;
+
+            pDst[2 * mk]     =  er - c * orC - s * oi;
+            pDst[2 * mk + 1] = -ei + c * oi  - s * orC;
+        }
+
+        // k = M/2 is exact when M is a power of 2 (always the case here).
+        if (M % 2 == 0) {
+            int k = M / 2;
+            float zrk = pDst[2 * k];
+            float zik = pDst[2 * k + 1];
+
+            float angle = 2.0f * (float)M_PI * k / N;
+            float c = cosf(angle);
+            float s = sinf(angle);
+
+            pDst[2 * k]     = zrk + c * zik;
+            pDst[2 * k + 1] = -s * zik;
+        }
+    }
+
+    // Magnitude of interleaved complex pairs. Safe for in-place operation.
+    inline void cmplxMagF32(float* pSrc, float* pDst, uint32_t numSamples) {
+        for (uint32_t i = 0; i < numSamples; i++) {
+            float re = pSrc[2 * i];
+            float im = pSrc[2 * i + 1];
+            pDst[i] = sqrtf(re * re + im * im);
+        }
+    }
+
+#endif  // SIGNALCORE_USE_CMSIS
+
+} // namespace detail
+
+
+// --- Fast log approximation ---
+
+// Polynomial approximation of log2(x), accurate to ~0.01 dB across the float
+// range. Used by the fast dB conversion path on platforms where log10f is
+// expensive.
+inline float log2fApprox(float X) {
+    float Y, F;
+    int E;
+    F = frexpf(fabsf(X), &E);
+    Y = 1.23149591368684f;
+    Y *= F;
+    Y += -4.11852516267426f;
+    Y *= F;
+    Y += 6.02197014179219f;
+    Y *= F;
+    Y += -3.13396450166353f;
+    Y += E;
+    return Y;
+}
+
+inline float log10fFast(float x) {
+    return log2fApprox(x) * 0.3010299956639812f;
+}
+
+
+// --- Helper functions ---
+
+inline void removeDC(float* samples, int size) {
+    float m = 0.0f;
+    for (int i = 0; i < size; i++) m += samples[i];
+    m = m / (float)size;
+    for (int i = 0; i < size; i++) samples[i] -= m;
+}
+
+
+// Index of the largest element in data[start .. size-1], returned as an
+// absolute index. `start` lets a caller skip leading bins without slicing the
+// pointer and re-adding the offset: pass 1 to ignore the DC bin (index 0) of an
+// FFT magnitude buffer when searching for a tone.
+inline int findPeak(float* data, int size, int start = 0) {
+    double peak = -DBL_MAX;
+    int bin = start;
+    for (int i = start; i < size; i++) {
+        if (data[i] > peak) {
+            peak = data[i];
+            bin = i;
+        }
+    }
+    return bin;
+}
+
+
+inline float mean(float* data, int size) {
+    double sum = 0.0;
+    for (int i = 0; i < size; i++) sum += data[i];
+    return (float)(sum / (double)size);
+}
+
+
+inline float signalToNoiseRatioDB(float signalAmplitude, float noiseAmplitude) {
+    if (noiseAmplitude == 0.0f) return 0.0f;
+    return 20.0f * log10fFast(signalAmplitude / noiseAmplitude);
+}
+
+
+// Signal-to-noise-and-distortion ratio in dB. Walks outward from the peak
+// bin, accumulating signal power until the bins drop below the mean, then
+// accumulates noise power for the rest of the span.
+inline float SINAD(float* data, int size) {
+    double avg = mean(data, size);
+    int peakBin = findPeak(data, size);
+
+    float signalPower = 0.0f;
+    float noisePower  = 0.0f;
+
+    int bin = peakBin;
+    for (; bin < size; bin++) {
+        if ((data[bin] - avg) >= avg) signalPower += data[bin] * data[bin];
+        else break;
+    }
+    for (; bin < size; bin++) noisePower += data[bin] * data[bin];
+
+    bin = peakBin - 1;
+    for (; bin > 0; bin--) {
+        if ((data[bin] - avg) >= avg) signalPower += data[bin] * data[bin];
+        else break;
+    }
+    for (; bin > 0; bin--) noisePower += data[bin] * data[bin];
+
+    if (noisePower == 0.0f) return 0.0f;
+    return 10.0f * log10f((float)(signalPower / noisePower));
+}
+
+
+// Effective number of bits, derived from SINAD via the standard formula.
+inline float ENOB(float* data, int size) {
+    return (SINAD(data, size) - 1.76f) / 6.02f;
+}
+
+
+// --- FFT template class ---
+
+// FFT_LENGTH is a plain integer (e.g. 512 or FFTSize::N512 — the unscoped enum
+// value converts). The same symbol can therefore size the sample arrays in a
+// sketch, so callers no longer track the length and the template argument
+// separately.
+template<size_t FFT_LENGTH>
+class FFT {
+private:
+    static constexpr int N = static_cast<int>(FFT_LENGTH);
+
+    // The transform is radix-2, so the length must be a power of two. The enum
+    // used to guarantee this; with a free integer parameter we check it here so
+    // FFT<500> fails loudly at compile time instead of producing garbage.
+    static_assert(FFT_LENGTH >= 32 && (FFT_LENGTH & (FFT_LENGTH - 1)) == 0,
+                  "FFT size must be a power of two >= 32 (32, 64, ... 4096)");
+
+    // Catch oversized FFTs at compile time so a sketch does not burn the
+    // entire RAM of an UNO trying to allocate a 4096-point transform. The
+    // limit lives in Platform.h: 256 for AVR, 1024 for ESP8266, 4096 elsewhere.
+    static_assert(N <= SIGNALCORE_MAX_FFT_SIZE,
+                  "FFT size exceeds SIGNALCORE_MAX_FFT_SIZE for this platform "
+                  "(see src/signalcore/Platform.h)");
+
+public:
+    FFT() : windowType_(WindowType::None), windowSum_(0.0f) {
+        detail::rfftFastInitF32(&fftStruct_, N);
+    }
+
+    operator float*() { return result_; }
+
+    void setWindowType(WindowType wt, uint32_t size = N) {
+        windowType_ = wt;
+        windowSum_  = createWindowCoefficients(windowCoef_, size, wt);
+    }
+
+    void calculate(uint16_t* source, int size = N) {
+        for (int i = 0; i < size; i++) samples_[i] = (float)source[i];
+        for (int i = size; i < N; i++) samples_[i] = 0.0f;
+        forward(size);
+    }
+
+    void calculate(int16_t* source, int size = N) {
+        for (int i = 0; i < size; i++) samples_[i] = (float)source[i];
+        for (int i = size; i < N; i++) samples_[i] = 0.0f;
+        forward(size);
+    }
+
+    void calculate(float* source, int size = N) {
+        for (int i = 0; i < size; i++) samples_[i] = source[i];
+        for (int i = size; i < N; i++) samples_[i] = 0.0f;
+        forward(size);
+    }
+
+    void forward(int size) {
+        if (windowType_ != WindowType::None && windowType_ != WindowType::Rectangle) {
+            for (int i = 0; i < size / 2; i++) {
+                samples_[i] = samples_[i] * windowCoef_[i];
+                samples_[size - (i + 1)] = samples_[size - (i + 1)] * windowCoef_[i];
+            }
+        }
+
+        detail::rfftFastF32(&fftStruct_, samples_, result_, 0);
+
+        // Scale results to match time-domain amplitude and account for
+        // windowing losses. The transform packs DC into result[0] and Nyquist
+        // into result[1]; the rest is interleaved complex pairs.
+        if (windowSum_ == 0.0f) windowSum_ = (float)(N / 2);
+        float scale = windowSum_;
+
+        float DC      = fabsf(result_[0]) / (scale * 2.0f);
+        float nyquist = fabsf(result_[1]) / scale;
+
+        detail::cmplxMagF32(result_, result_, (N / 2));
+
+        for (int i = 0; i < (N / 2); i++) {
+            result_[i] = result_[i] / scale;
+        }
+
+        result_[0]       = DC;
+        result_[(N / 2)] = nyquist;
+    }
+
+    void postScaleDB(float floor = -100.0f, float maxScale = 32767.0f) {
+        for (int i = 0; i <= (N / 2); i++) {
+            result_[i] = constrain(20.0f * log10f(result_[i] / maxScale), floor, 10.0f);
+        }
+    }
+
+    void postScaleDBFast(float floor = -100.0f, float maxScale = 32767.0f) {
+        for (int i = 0; i <= (N / 2); i++) {
+            result_[i] = constrain(20.0f * log10fFast(result_[i] / maxScale), floor, 10.0f);
+        }
+    }
+
+    // Index of the dominant magnitude bin over the valid range result[0 .. N/2].
+    // skipDC starts the search at bin 1 so a DC offset in the input cannot win;
+    // leave it true for tone detection. Call before postScaleDB() if you also
+    // need the linear level, since postScaleDB() rewrites the buffer with dB.
+    int peakBin(bool skipDC = true) {
+        return findPeak(result_, (N / 2) + 1, skipDC ? 1 : 0);
+    }
+
+    // Frequency of the dominant bin in Hz for a given capture sample rate.
+    float peakFrequency(float sampleRate, bool skipDC = true) {
+        return (float)peakBin(skipDC) * sampleRate / (float)N;
+    }
+
+private:
+    detail::RFFTInstanceF32 fftStruct_;
+    float       samples_[N];
+    float       result_[N];
+    WindowType  windowType_;
+    float       windowCoef_[N / 2];
+    float       windowSum_;
+};
+
+} // namespace signalcore
+
+#endif // _SIGNALCORE_FFT_H_
