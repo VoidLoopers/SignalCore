@@ -8,12 +8,14 @@
  * arm_rfft_fast_f32. On all other platforms, uses a portable radix-2
  * Cooley-Tukey implementation that produces identical output packing.
  *
- * Output format (matches CMSIS arm_rfft_fast_f32 packing):
- *   result[0]       = DC bin (real, magnitude)
- *   result[1]       = Nyquist bin (real, magnitude)  -- before post-processing
- *   result[2..N-1]  = complex pairs [re, im] for bins 1..(N/2 - 1)
- *
- * After forward(), result[0..N/2] contains scaled magnitudes.
+ * Output format, in two stages:
+ *   Raw transform packing (internal, matches CMSIS arm_rfft_fast_f32):
+ *     result[0]      = DC (real), result[1] = Nyquist (real),
+ *     result[2..N-1] = complex pairs [re, im] for bins 1..(N/2 - 1)
+ *   After forward()/calculate():
+ *     result[0..N/2] = linear amplitude magnitudes, DC through Nyquist
+ *                      (N/2 + 1 valid bins); entries above N/2 are stale
+ *                      scratch from the transform — never read them.
  *
  * Platform: Any Arduino-compatible board
  *
@@ -86,6 +88,9 @@ namespace detail {
 
 #if defined(SIGNALCORE_USE_CMSIS)
 
+// Close the namespaces before including the CMSIS headers: arm_math.h must
+// be parsed at global scope or the ARM symbols would be declared inside
+// signalcore::detail and fail to link. Reopened immediately below.
 } // namespace detail
 } // namespace signalcore
 
@@ -165,9 +170,10 @@ namespace detail {
     }
 
     // Real FFT of N samples using an N/2-point complex FFT. Output is packed
-    // in CMSIS arm_rfft_fast_f32 format. The input buffer (pSrc) is consumed
-    // and its contents are undefined after the call — use separate input and
-    // output buffers.
+    // in CMSIS arm_rfft_fast_f32 format. This generic version leaves pSrc
+    // intact, but the CMSIS backend clobbers it — the cross-backend contract
+    // is that pSrc is undefined after the call, so portable callers must use
+    // separate input and output buffers.
     inline void rfftFastF32(RFFTInstanceF32* S, float* pSrc, float* pDst, uint8_t /*ifftFlag*/) {
         int N = S->fftLen;
         int M = N / 2;
@@ -296,14 +302,20 @@ inline float mean(float* data, int size) {
 
 
 inline float signalToNoiseRatioDB(float signalAmplitude, float noiseAmplitude) {
+    // 0 dB here is a divide-by-zero sentinel for "no measurable noise",
+    // not a real ratio (a true 0 dB would mean signal equals noise).
     if (noiseAmplitude == 0.0f) return 0.0f;
     return 20.0f * log10fFast(signalAmplitude / noiseAmplitude);
 }
 
 
-// Signal-to-noise-and-distortion ratio in dB. Walks outward from the peak
-// bin, accumulating signal power until the bins drop below the mean, then
-// accumulates noise power for the rest of the span.
+// Signal-to-noise-and-distortion ratio in dB, computed from LINEAR
+// magnitudes — call this before postScaleDB(), never on dB data (on dB it
+// returns nonsense silently). Walks outward from the peak bin, counting
+// bins as "signal" while they stay at or above twice the spectrum mean
+// (the test (data[bin] - avg) >= avg is data[bin] >= 2*avg); the remaining
+// bins in each direction count as noise+distortion power. Bin 0 (DC) is
+// excluded from both sums.
 inline float SINAD(float* data, int size) {
     double avg = mean(data, size);
     int peakBin = findPeak(data, size);
@@ -342,6 +354,11 @@ inline float ENOB(float* data, int size) {
 // value converts). The same symbol can therefore size the sample arrays in a
 // sketch, so callers no longer track the length and the template argument
 // separately.
+//
+// Memory: each instance embeds samples_[N] + result_[N] + windowCoef_[N/2]
+// = 2.5 * N floats (10 * N bytes): FFT<1024> ~ 10 KB, FFT<4096> ~ 40 KB.
+// Declare instances at global/static scope — a function-local FFT of any
+// real size will overflow the stack on embedded targets.
 template<size_t FFT_LENGTH>
 class FFT {
 private:
@@ -365,13 +382,30 @@ public:
         detail::rfftFastInitF32(&fftStruct_, N);
     }
 
+    // Access the magnitude spectrum computed by the last calculate()/forward().
+    // Only result[0 .. N/2] are meaningful (N/2 + 1 bins: DC through Nyquist);
+    // entries above N/2 are leftover FFT scratch — do not read or plot them.
+    // The pointer aliases internal storage: it is overwritten by the next
+    // calculate() and rewritten in place (linear -> dB) by postScaleDB().
     operator float*() { return result_; }
 
+    // Select the analysis window. `size` must match the sample count later
+    // passed to calculate() — a mismatch applies a wrong-length window and
+    // skews the amplitude scaling. Values above N are clamped: the
+    // coefficient buffer holds N/2 entries. Leave it at the default N unless
+    // you deliberately transform partial (zero-padded) buffers.
     void setWindowType(WindowType wt, uint32_t size = N) {
+        if (size > (uint32_t)N) size = N;
         windowType_ = wt;
         windowSum_  = createWindowCoefficients(windowCoef_, size, wt);
     }
 
+    // The calculate() overloads copy `size` samples in, zero-pad to N,
+    // window, transform, and scale. Zero-padding keeps bin spacing at
+    // sampleRate/N, but the amplitude scaling assumes a full buffer, so
+    // partial captures read low by size/N. Raw unipolar ADC data carries a
+    // large DC offset that lands in bin 0 — peakBin() skips it by default,
+    // or call removeDC() on a float copy first for a clean spectrum.
     void calculate(uint16_t* source, int size = N) {
         for (int i = 0; i < size; i++) samples_[i] = (float)source[i];
         for (int i = size; i < N; i++) samples_[i] = 0.0f;
@@ -400,14 +434,24 @@ public:
 
         detail::rfftFastF32(&fftStruct_, samples_, result_, 0);
 
-        // Scale results to match time-domain amplitude and account for
-        // windowing losses. The transform packs DC into result[0] and Nyquist
-        // into result[1]; the rest is interleaved complex pairs.
+        // Scale so a full-amplitude sine centered on a bin reads its
+        // time-domain amplitude in the output (same units as the input).
+        // windowSum_ is the sum of the FIRST HALF of the window = (sum of
+        // all N coefficients)/2, so dividing by it is the textbook
+        // single-sided correction 2/sum(w): the factor 2 recovers the energy
+        // of the discarded negative frequencies, and sum(w) undoes the
+        // window's coherent gain. With no window set, windowSum_ falls back
+        // to N/2 (rectangle sum / 2).
         if (windowSum_ == 0.0f) windowSum_ = (float)(N / 2);
         float scale = windowSum_;
 
+        // DC and Nyquist each appear exactly once in the real spectrum (no
+        // negative-frequency twin), so both must skip the single-sided x2
+        // baked into `scale` — hence the extra /2 relative to interior bins.
+        // The transform packs DC into result[0] and Nyquist into result[1];
+        // the rest is interleaved complex pairs.
         float DC      = fabsf(result_[0]) / (scale * 2.0f);
-        float nyquist = fabsf(result_[1]) / scale;
+        float nyquist = fabsf(result_[1]) / (scale * 2.0f);
 
         detail::cmplxMagF32(result_, result_, (N / 2));
 
@@ -419,12 +463,22 @@ public:
         result_[(N / 2)] = nyquist;
     }
 
+    // Convert result[0..N/2] in place from linear magnitude to dB relative
+    // to full scale: 20*log10(mag / maxScale). The default maxScale = 32767
+    // assumes int16-scale samples; pass 1.0f for normalized float input, or
+    // 4095.0f for a 12-bit ADC — otherwise every reading is offset by a
+    // constant dB. Output is clamped to [floor, +10]: the floor tames
+    // log10(0) = -inf on empty bins, the +10 dB ceiling absorbs slight
+    // overshoot (windowing/rounding) above full scale. Linear magnitudes
+    // are destroyed — call peakBin()/SINAD()/ENOB() first if you need them.
     void postScaleDB(float floor = -100.0f, float maxScale = 32767.0f) {
         for (int i = 0; i <= (N / 2); i++) {
             result_[i] = constrain(20.0f * log10f(result_[i] / maxScale), floor, 10.0f);
         }
     }
 
+    // Same contract as postScaleDB() with the polynomial log approximation
+    // (~0.01 dB error) for platforms where log10f is expensive.
     void postScaleDBFast(float floor = -100.0f, float maxScale = 32767.0f) {
         for (int i = 0; i <= (N / 2); i++) {
             result_[i] = constrain(20.0f * log10fFast(result_[i] / maxScale), floor, 10.0f);
@@ -440,6 +494,9 @@ public:
     }
 
     // Frequency of the dominant bin in Hz for a given capture sample rate.
+    // Resolution is one bin = sampleRate / N, so the true tone is within
+    // +/- half a bin of the returned value; interpolate around peakBin()
+    // if you need finer estimates.
     float peakFrequency(float sampleRate, bool skipDC = true) {
         return (float)peakBin(skipDC) * sampleRate / (float)N;
     }

@@ -69,7 +69,7 @@ void setup() {
     trig.setThreshold(TRIGGER_LEVEL);
     trig.setPosition(TRIGGER_POS);
 
-    Serial.print("# Trigger mode: "); Serial.println(toString(trig.getTriggerMode()));
+    Serial.print("# Trigger mode: "); Serial.println(toString(trig.mode()));
 }
 
 void loop() {

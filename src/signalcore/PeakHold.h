@@ -56,8 +56,12 @@ namespace signalcore {
 
 class PeakHoldProcessor {
 public:
-    PeakHoldProcessor(size_t size, float decay = 0.95f)
-        : size_(size), result_(new float[size]()), decay_(decay) {
+    // decay is the fraction KEPT from the previous peak (higher = slower
+    // fade). This is the OPPOSITE convention from ExponentialMovingAverage's
+    // sampleWeight, which is the fraction given to the NEW sample:
+    // decay = 1 - sampleWeight.
+    PeakHoldProcessor(size_t size, float decay = 0.95f, bool isActive = true)
+        : active(isActive), size_(size), result_(new float[size]()), decay_(decay) {
         reset();
     }
 
@@ -65,6 +69,16 @@ public:
         delete[] result_;
     }
 
+    // Owns a heap buffer of size * sizeof(float) bytes. Copying is disabled:
+    // two copies sharing one buffer would double-delete it. On RAM-limited
+    // boards note that `new` failure is not checked — construct once at
+    // startup and reuse via init() rather than allocating per frame.
+    PeakHoldProcessor(const PeakHoldProcessor&)            = delete;
+    PeakHoldProcessor& operator=(const PeakHoldProcessor&) = delete;
+
+    // Seed with -INFINITY so the first update() unconditionally captures
+    // the input. Don't read values (operator[] / float*) until after the
+    // first update — they are -inf until then.
     inline void reset() {
         for (size_t i = 0; i < size_; ++i) {
             result_[i] = -INFINITY;
@@ -78,24 +92,34 @@ public:
         reset();
     }
 
+    // Only min(inputSize, size()) elements are processed — a short input
+    // never reads past its own end.
     inline void update(float* samples, size_t inputSize) {
         size_t n = (inputSize < size_) ? inputSize : size_;
         for (size_t i = 0; i < n; ++i) {
             if (samples[i] >= result_[i]) {
                 result_[i] = samples[i];
             } else {
-                // Bleed the held peak toward the lower sample value.
+                // Bleed the held peak toward the lower sample value. The
+                // held value falls with time constant ~1/(1-decay) updates:
+                // decay=0.95 -> ~20 updates to close most of the gap.
                 result_[i] = result_[i] * decay_ + samples[i] * (1.0f - decay_);
             }
         }
     }
 
+    // Convenience overload: samples must hold at least size() elements.
+    inline void update(float* samples) { update(samples, size_); }
+
     inline float operator[](size_t index) const { return result_[index]; }
     inline operator float*() { return result_; }
 
     inline void   setDecay(float factor) { decay_ = factor; }
+    inline float  getDecay() const       { return decay_; }
     inline size_t size() const           { return size_; }
 
+    // Convenience flag for sketch-level enable/disable. The class itself
+    // never checks it — callers decide whether to call update().
     bool active = true;
 
 private:

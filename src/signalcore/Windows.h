@@ -4,7 +4,7 @@
  *
  * Provides the WindowType enum and a coefficient generator that fills the
  * first half of a buffer with the selected window. The second half is the
- * mirror of the first and is applied symmetrically by the FFT pre-emphasis
+ * mirror of the first and is applied symmetrically by the FFT's windowing
  * loop, which saves half the storage.
  *
  * Supported windows: rectangle, Hamming, Hann, triangle (Bartlett), Nuttall,
@@ -55,6 +55,17 @@
 
 namespace signalcore {
 
+// Choosing a window trades spectral leakage against frequency resolution:
+// heavier tapers (Blackman-Harris, Nuttall) suppress leakage skirts but
+// widen each peak; light tapers keep peaks narrow but leak more. Rules of
+// thumb: Hann is the general-purpose default; FlatTop gives the most
+// accurate amplitude readings (widest peak); Rectangle/None only for
+// transients or signals exactly periodic in the capture buffer.
+//
+// None and Rectangle are functionally identical (no shaping applied; the
+// FFT skips the multiply loop for both). Both exist so sketches can express
+// intent: None = "windowing not considered", Rectangle = "I chose a
+// rectangular window deliberately".
 enum class WindowType : uint8_t {
     None,
     Rectangle,
@@ -108,8 +119,16 @@ constexpr const char* getWindowName(WindowType win, bool abbr = false) {
 // Fill the first `size/2` entries of `array` with the selected window's
 // coefficients and return the sum of those entries. The FFT path applies the
 // window symmetrically, so only half of the coefficients are stored.
+//
+// The returned sum is the coherent-gain normalizer the FFT divides by (the
+// single-sided 2/sum(w) amplitude correction) — it is NOT a noise-power
+// (sum of squares) normalization, so it calibrates tone amplitudes, not
+// noise density.
 inline float createWindowCoefficients(float* array, uint32_t size, WindowType windowType) {
     float windowSum = 0.0f;
+    // size - 1 selects the symmetric window form (w[0] == w[size-1]).
+    // Changing this to size switches to the periodic convention and changes
+    // FFT amplitude behavior.
     float numSamplesMinus1 = (float)size - 1.0f;
     for (uint16_t i = 0; i < size / 2; i++) {
         float ratio = (float)i / numSamplesMinus1;
@@ -136,6 +155,11 @@ inline float createWindowCoefficients(float* array, uint32_t size, WindowType wi
                                      - (0.012604f * cosf((6.0f * (float)M_PI) * ratio));
                 break;
             case WindowType::Blackman:
+                // Blackman/FlatTop coefficient sets follow the legacy SDSP
+                // tables, normalized so the window peaks at 1.0; they differ
+                // slightly from the textbook "classic Blackman"
+                // (0.42/0.50/0.08). FlatTop is a 3-term variant, not the
+                // common 5-term flat-top — expect a narrower main lobe.
                 array[i] = 0.42323f - (0.49755f * cosf((2.0f * (float)M_PI) * ratio))
                                     + (0.07922f * cosf((4.0f * (float)M_PI) * ratio));
                 break;

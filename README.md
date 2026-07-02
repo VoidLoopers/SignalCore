@@ -27,7 +27,7 @@ a signal.
 | Generate a test tone, sweep, or modulate a signal in software | The **DDS** signal generator |
 | Reduce spectral leakage before a transform | **Window** functions |
 | Stabilize a repeating waveform | The **Trigger** module |
-| Transform, filter, or smooth a dataset | **PeakHold**, **MovingAverage** (exponential) |
+| Transform, filter, or smooth a dataset | **PeakHoldProcessor**, **ExponentialMovingAverage** |
 
 ## Install
 
@@ -160,8 +160,10 @@ A few things worth knowing:
   dominant tone directly. To read the spectrum itself, treat the FFT object as a
   `float*` array, where only the first `N/2 + 1` entries hold real magnitude
   bins.
-- **Board limits.** On an AVR board such as an UNO or Nano, the largest FFT is
-  256 points (`FFT<256>`).
+- **Board limits.** The AVR build cap is 256 points, sized for larger AVR parts
+  such as the Mega 2560 (8 KB of SRAM). On an ATmega328 board (UNO R3, Nano,
+  2 KB of SRAM) the practical ceiling is `FFT<128>` (~1.3 KB plus your own
+  sample buffer) — `FFT<256>` compiles but does not fit at run time.
 
 > [!TIP]
 > On a Teensy 4.x the FFT runs on CMSIS-DSP automatically, with no change to this
@@ -246,13 +248,18 @@ float s = (float)sig.nextSample(0);          // 0 means full-resolution float
 
 For tight, table-driven tone generation without modulation or noise, `DDS`
 together with `DDSSineTable<>` is the low-level path: a 32-bit phase accumulator
-steps through a wave table built at compile time.
+steps through an `int32_t` wave table. The table is filled when the
+`DDSSineTable<>` object is constructed and lives in RAM — 4 bytes per sample
+(`Samples1024` = 4 KB), so size it to your board.
 
 ### Streaming processors
 
 Three classes work on a running stream of data across many calls, rather than on a
-single one-shot buffer. Each keeps its result in an internal array that you read
-back the same way as an FFT result, by indexing it or reading it as a `float*`.
+single one-shot buffer. `PeakHoldProcessor` and `ExponentialMovingAverage` keep
+their results in an internal array that you read back the same way as an FFT
+result, by indexing it or reading it as a `float*`. `Trigger` owns no result
+array — `calculateOffset()` returns a pointer into the capture buffer you pass
+it, and `valid()` tells you whether that pointer is actually edge-aligned.
 
 - **`Trigger`** finds a rising or falling edge in a sample buffer and reports an
   offset so that edge sits at a fixed position in the frame you draw. It uses
@@ -279,8 +286,8 @@ that behavior. Set them **before** `#include <SignalCore.h>`.
 
 | Macro | Default | What it controls |
 |---|---|---|
-| `SIGNALCORE_FORCE_CMSIS` | (off) | On a non-Teensy ARM core, opt in to the CMSIS-DSP FFT backend. It takes effect only when the selected core actually links the CMSIS-DSP code. Ignored on non-ARM boards. |
-| `SIGNALCORE_MAX_FFT_SIZE` | 256 (AVR) · 1024 (ESP8266) · 4096 (other) | The largest FFT size the build will accept. The `FFT<>` template checks its size against this with a `static_assert`, so an oversized transform fails to compile instead of exhausting RAM at run time. |
+| `SIGNALCORE_FORCE_CMSIS` | (off) | On a non-Teensy ARM core, switch to the CMSIS-DSP FFT backend. The switch is unconditional: if the core does not ship `arm_math.h` the build stops with a clear `#error`, and if the core ships the header but does not link the DSP objects, expect `arm_rfft_fast_*` linker errors. Ignored on non-ARM boards. |
+| `SIGNALCORE_MAX_FFT_SIZE` | 256 (AVR) · 1024 (ESP8266) · 4096 (other) | The largest FFT size the build will accept. The `FFT<>` template checks its size against this with a `static_assert`, so an oversized transform fails to compile instead of exhausting RAM at run time. Define it before the include to raise or lower the cap for your board. |
 
 ### Supported boards
 
@@ -291,7 +298,7 @@ that behavior. Set them **before** `#include <SignalCore.h>`.
 | ESP32 / ESP32-S3 | Generic C++ | ESP-DSP wrapper reserved for future use |
 | RP2040 / RP2350 | Generic C++ | |
 | SAMD21 | Generic C++ | |
-| AVR (UNO, Nano, Pro Micro) | Generic C++ | FFT capped at 256 points by `SIGNALCORE_MAX_FFT_SIZE` |
+| AVR (UNO, Nano, Pro Micro) | Generic C++ | FFT capped at 256 points by `SIGNALCORE_MAX_FFT_SIZE`; ATmega328 boards fit `FFT<128>` at most in practice |
 | ESP8266 | Generic C++ | FFT capped at 1024 points |
 | Any Arduino-compatible board with a C++11 compiler | Generic C++ | |
 

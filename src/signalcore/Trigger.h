@@ -90,6 +90,10 @@ public:
         reset();
     }
 
+    // Clears the Schmitt-trigger arm state and the valid flag. The arm
+    // state deliberately persists across calculateOffset() calls (that is
+    // what lets an edge that starts in one buffer fire in the next) — call
+    // reset() when switching the trigger to a different signal/channel.
     inline void reset() {
         lastState_ = false;
         valid_     = false;
@@ -102,6 +106,12 @@ public:
     inline bool valid() const { return valid_; }
     inline TriggerMode mode() const { return mode_; }
 
+    // Set a fixed trigger level in the same units as the sample data.
+    // NOTE: the hysteresis margin is derived from the min/max range, which
+    // is only auto-scanned when no fixed threshold is set. With a fixed
+    // threshold the range keeps its default of 0..3.3 (volts) — on signals
+    // with a different range also call setMinMax(), or the margin will be
+    // far too large (or small) and the trigger will misbehave.
     inline void setThreshold(float threshold) {
         threshold_ = threshold;
     }
@@ -116,20 +126,43 @@ public:
      * Find a trigger point in the data buffer and return a pointer offset
      * so that the trigger event is near the center of the output window.
      *
+     * The buffer must be oversized: the search needs room on both sides of
+     * the trigger point, so capture 2-3x outputSize samples
+     * (inputCapacity >> outputSize). With inputCapacity == outputSize no
+     * trigger can ever be placed and the call always fails.
+     *
      * @param data           Pointer to the sample buffer (float voltages)
      * @param outputSize     Number of samples in the output view window
      * @param inputCapacity  Total number of samples available in data
      * @return Pointer to the start of the aligned output window, or data if no trigger found
+     *
+     * @note On failure this still returns a drawable pointer (the raw,
+     *       untriggered buffer). Always check valid() after calling: false
+     *       means the frame is unaligned — draw it anyway (auto-trigger
+     *       behavior) or skip it (normal-trigger behavior). valid() reflects
+     *       only the most recent calculateOffset() call.
      */
     inline float* calculateOffset(float* data, size_t outputSize, size_t inputCapacity) {
         if (!data || inputCapacity == 0 || outputSize == 0) {
             valid_ = false;
             return data;
         }
-        if (mode_ == TriggerMode::None) return data;
+        if (mode_ == TriggerMode::None) {
+            // A disabled trigger never aligns a frame; without this a stale
+            // true from an earlier mode would report valid forever.
+            valid_ = false;
+            return data;
+        }
 
         if (threshold_ == TRIGGER_NO_THRESHOLD) findMinMax(data, inputCapacity);
 
+        // Schmitt-trigger search with progressive relaxation. Start strict:
+        // require the signal to cross threshold by a 5% margin of the
+        // signal range (m) using a 4-sample average (n) so noise spikes
+        // cannot fire the trigger. If no crossing qualifies, relax in steps
+        // — narrower margin (down to 1%) and less averaging (down to raw
+        // samples) — trading noise immunity for sensitivity. Give up after
+        // maxTries and report invalid.
         int triggerIndex = NO_TRIGGER_FOUND;
         float m = 0.05f;
         int n = 4;
@@ -165,8 +198,6 @@ public:
         min_ = minValue;
         max_ = maxValue;
     }
-
-    inline TriggerMode getTriggerMode() const { return mode_; }
 
 private:
 
@@ -242,9 +273,11 @@ private:
         return sum / (float)n;
     }
 
-    TriggerMode mode_      = TriggerMode::None;
-    float       threshold_ = TRIGGER_NO_THRESHOLD;
-    float       position_  = 0.5f;
+    // mode_/threshold_/position_ are always set by the constructor — their
+    // defaults live in the constructor signature, not here.
+    TriggerMode mode_;
+    float       threshold_;
+    float       position_;
     bool        lastState_ = false;
     bool        valid_     = false;
     float       min_ = 0.0f, max_ = 3.3f;

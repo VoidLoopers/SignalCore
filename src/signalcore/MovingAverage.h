@@ -56,6 +56,10 @@ namespace signalcore {
 
 class ExponentialMovingAverage {
 public:
+    // sampleWeight is the fraction given to the NEW sample (higher = faster
+    // response). This is the OPPOSITE convention from PeakHoldProcessor's
+    // decay, which is the fraction kept from the OLD value:
+    // sampleWeight = 1 - decay.
     ExponentialMovingAverage(size_t size, float sampleWeight = 0.2f, bool isActive = true)
         : active(isActive), size_(size), sampleWeight_(sampleWeight), result_(nullptr), reinit_(true) {
         result_ = new float[size_]();
@@ -65,6 +69,13 @@ public:
         delete[] result_;
     }
 
+    // Owns a heap buffer of size * sizeof(float) bytes. Copying is disabled:
+    // two copies sharing one buffer would double-delete it. On RAM-limited
+    // boards note that `new` failure is not checked — construct once at
+    // startup and reuse via init() rather than allocating per frame.
+    ExponentialMovingAverage(const ExponentialMovingAverage&)            = delete;
+    ExponentialMovingAverage& operator=(const ExponentialMovingAverage&) = delete;
+
     inline void init(size_t newSize) {
         delete[] result_;
         size_   = newSize;
@@ -72,25 +83,42 @@ public:
         reinit_ = true;
     }
 
+    // Restart the average: the next update() copies its input verbatim
+    // instead of blending, exactly like a freshly constructed instance.
+    inline void reset() { reinit_ = true; }
+
     inline void  setSampleWeight(float sampleWeight) { sampleWeight_ = sampleWeight; }
     inline float getSampleWeight() const             { return sampleWeight_; }
 
-    inline void update(float* samples) {
+    // Only min(inputSize, size()) elements are processed — a short input
+    // never reads past its own end. On the first update after construction,
+    // init(), or reset(), the input is copied verbatim to avoid the long
+    // exponential ramp-up from zero.
+    inline void update(float* samples, size_t inputSize) {
+        size_t n = (inputSize < size_) ? inputSize : size_;
         if (reinit_) {
-            memcpy(result_, samples, size_ * sizeof(float));
+            memcpy(result_, samples, n * sizeof(float));
             reinit_ = false;
             return;
         }
-        for (size_t i = 0; i < size_; ++i) {
+        for (size_t i = 0; i < n; ++i) {
+            // Single-pole IIR: y = w*x + (1-w)*y. Time constant is roughly
+            // 1/sampleWeight updates — w=0.2 settles in ~5 frames, w=0.01
+            // in ~100.
             result_[i] = sampleWeight_ * samples[i] + (1.0f - sampleWeight_) * result_[i];
         }
     }
+
+    // Convenience overload: samples must hold at least size() elements.
+    inline void update(float* samples) { update(samples, size_); }
 
     inline float operator[](size_t index) const { return result_[index]; }
     inline operator float*() { return result_; }
 
     inline size_t size() const { return size_; }
 
+    // Convenience flag for sketch-level enable/disable. The class itself
+    // never checks it — callers decide whether to call update().
     bool active = true;
 
 private:

@@ -56,6 +56,15 @@
 #if defined(TEENSYDUINO)
     #define SIGNALCORE_USE_CMSIS 1
 #elif (defined(__arm__) || defined(__ARM_ARCH)) && defined(SIGNALCORE_FORCE_CMSIS)
+    // Fail here with a clear message rather than later with raw
+    // "undefined reference to arm_rfft_fast_init_f32" linker errors: the
+    // force macro switches the backend unconditionally and does not detect
+    // whether the selected core actually ships CMSIS-DSP.
+    #if defined(__has_include)
+        #if !__has_include("arm_math.h")
+            #error "SIGNALCORE_FORCE_CMSIS is defined but this core does not provide arm_math.h. Remove the define to use the generic C++ backend."
+        #endif
+    #endif
     #define SIGNALCORE_USE_CMSIS 1
 #endif
 
@@ -77,14 +86,19 @@
 
 // --- Platform capability limits ---
 
-#if defined(__AVR__)
-    // ATmega328 has 2 KB RAM; a 256-point FFT already needs ~3 KB of buffers.
-    // Sketches that target larger AVR parts may raise this manually.
-    #define SIGNALCORE_MAX_FFT_SIZE 256
-#elif defined(ESP8266)
-    #define SIGNALCORE_MAX_FFT_SIZE 1024
-#else
-    #define SIGNALCORE_MAX_FFT_SIZE 4096
+// Sketches may override the cap by defining SIGNALCORE_MAX_FFT_SIZE before
+// including SignalCore.h — the #ifndef guard is what makes that work.
+#ifndef SIGNALCORE_MAX_FFT_SIZE
+    #if defined(__AVR__)
+        // The cap targets larger AVR parts (Mega 2560, 8 KB). An ATmega328
+        // (UNO R3/Nano, 2 KB) cannot actually hold a 256-point FFT: the
+        // buffers alone need ~2.5 KB — FFT<128> is the practical ceiling.
+        #define SIGNALCORE_MAX_FFT_SIZE 256
+    #elif defined(ESP8266)
+        #define SIGNALCORE_MAX_FFT_SIZE 1024
+    #else
+        #define SIGNALCORE_MAX_FFT_SIZE 4096
+    #endif
 #endif
 
 // --- Common math fallbacks ---
@@ -100,10 +114,9 @@
 
 namespace signalcore {
 
-// Wrap a phase value into [0, 2*pi). Multi-period inputs are wrapped in a
-// single pass per direction; large positive or negative excursions are
-// supported because phase accumulators can overshoot at high modulation
-// rates relative to the sample rate.
+// Wrap a phase value into [0, 2*pi) by repeated subtraction — cheap for the
+// small overshoots a phase accumulator produces each sample, but not O(1)
+// for arbitrarily large inputs (each excess period costs one loop pass).
 inline double wrapPhase(double phase) {
     while (phase >= M_TWOPI) {
         phase -= M_TWOPI;
