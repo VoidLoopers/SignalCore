@@ -23,6 +23,7 @@ a signal.
 | What you want to do | What to reach for |
 |---|---|
 | Perform an **FFT**, find peaks | The **FFT** transform with `peakBin()` and `peakFrequency()` |
+| Change the FFT length at run time (a resolution control in a UI) | The runtime-sized **DynamicFFT** |
 | Measure signal quality (SINAD, ENOB) | **FFT** metrics read off the magnitude spectrum |
 | Generate a test tone, sweep, or modulate a signal in software | The **DDS** signal generator |
 | Reduce spectral leakage before a transform | **Window** functions |
@@ -230,6 +231,38 @@ fft.setWindowType(WindowType::BlackmanHarris);
 
 ![Window Function Explorer](docs/images/concepts/01-window-function-explorer.png)
 
+### Changing the FFT size at run time
+
+`FFT<N>` fixes its length when the sketch compiles. When the length itself is a
+run-time choice — a spectrum analyzer with a resolution control, or a sketch
+that adapts resolution to the frame rate — use `DynamicFFT` instead. It runs
+the identical transform with the identical output packing and scaling; the only
+differences are that its buffers live on the heap and its size is set with
+`init()`:
+
+```cpp
+DynamicFFT fft;
+
+void setup() {
+    fft.init(1024);                                 // power of two, 32 up to the platform cap
+    fft.setWindowType(WindowType::BlackmanHarris);  // set after every init()
+}
+
+void changeResolution(int newSize) {
+    fft.init(newSize);                              // reallocates live, frame to frame
+    fft.setWindowType(WindowType::BlackmanHarris);  // window length depends on FFT length
+}
+```
+
+`init()` returns `false` and leaves the object inert if the size is not a power
+of two, is outside the platform cap, or the heap allocation fails — before a
+successful `init()` every processing call is a safe no-op. Because each
+`init()` reallocates, prefer `FFT<N>` when the length never changes, and on
+RAM-tight boards mind heap fragmentation just as with the streaming processors.
+`postScaleDB()` on `DynamicFFT` also accepts a third `ceiling` argument for
+boards whose ADC full scale sits above the display reference (for example
++10.37 dBV for a 3.3 Vpp ADC against a 1.0 Vpp reference).
+
 ### Signal generation
 
 Sometimes you need a signal and have no hardware to read, or you want a known,
@@ -321,6 +354,8 @@ floats):
 | 2048 | ~20 KB |
 | 4096 | ~40 KB |
 
+`DynamicFFT` needs the same `2·N + N/2` floats as `FFT<N>`, but takes them from
+the heap on each `init()` instead of reserving them statically.
 `PeakHoldProcessor` and `ExponentialMovingAverage` size their buffers when
 constructed, and they take that memory from the heap rather than reserving it
 statically. On a RAM-tight board such as an AVR, create them once at the size you
