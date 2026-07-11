@@ -20,7 +20,8 @@
  * Modules:
  *   - Platform.h       — board detection, phase wrapping, math fallbacks
  *   - Windows.h        — window functions and coefficient generation
- *   - FFT.h            — template FFT class and spectral helpers
+ *   - FFT.h            — template FFT class, runtime-sized DynamicFFT, and
+ *                        spectral helpers
  *   - DDS.h            — DDS oscillator and SignalGenerator
  *   - Trigger.h        — rising/falling edge trigger with hysteresis
  *   - PeakHold.h       — per-bin peak-hold with exponential decay

@@ -2,7 +2,8 @@
  * @file FFT.h
  * @brief Cross-Platform FFT and Spectral Analysis
  *
- * Provides a template-based FFT class and spectral analysis helpers. On ARM
+ * Provides a template-based FFT class, a runtime-sized DynamicFFT variant,
+ * and spectral analysis helpers. On ARM
  * platforms with CMSIS-DSP (Teensy 4.x by default, other ARM cores when
  * SIGNALCORE_FORCE_CMSIS is defined), uses hardware-accelerated
  * arm_rfft_fast_f32. On all other platforms, uses a portable radix-2
@@ -102,8 +103,8 @@ namespace detail {
 
     typedef arm_rfft_fast_instance_f32 RFFTInstanceF32;
 
-    inline void rfftFastInitF32(RFFTInstanceF32* S, uint16_t fftLen) {
-        arm_rfft_fast_init_f32(S, fftLen);
+    inline bool rfftFastInitF32(RFFTInstanceF32* S, uint16_t fftLen) {
+        return arm_rfft_fast_init_f32(S, fftLen) == ARM_MATH_SUCCESS;
     }
     inline void rfftFastF32(RFFTInstanceF32* S, float* pSrc, float* pDst, uint8_t ifftFlag) {
         arm_rfft_fast_f32(S, pSrc, pDst, ifftFlag);
@@ -165,8 +166,9 @@ namespace detail {
         }
     }
 
-    inline void rfftFastInitF32(RFFTInstanceF32* S, uint16_t fftLen) {
+    inline bool rfftFastInitF32(RFFTInstanceF32* S, uint16_t fftLen) {
         S->fftLen = fftLen;
+        return true;
     }
 
     // Real FFT of N samples using an N/2-point complex FFT. Output is packed
@@ -508,6 +510,206 @@ private:
     WindowType  windowType_;
     float       windowCoef_[N / 2];
     float       windowSum_;
+};
+
+
+// --- DynamicFFT: runtime-sized FFT ---
+
+// Same transform, packing, and scaling as FFT<N>, but the length is chosen —
+// and can be changed — at run time with init(). Use it when a sketch cycles
+// through FFT sizes live (a UI size control, adaptive resolution); when the
+// length is known at compile time, prefer FFT<N>, which needs no heap and
+// cannot fail to allocate.
+//
+// Memory: buffers live on the heap — 2.5 * N floats (10 * N bytes) per
+// init(), re-allocated on every call. Nothing is allocated until the first
+// init(), and calculate()/forward() are safe no-ops before it.
+//
+// init() clears the window selection: coefficient length depends on the FFT
+// length, so call setWindowType() again after every (re)size.
+class DynamicFFT {
+public:
+    DynamicFFT() = default;
+
+    ~DynamicFFT() {
+        release();
+    }
+
+    // Size the transform, allocating the internal buffers. `size` must be a
+    // power of two >= 32 and <= SIGNALCORE_MAX_FFT_SIZE (a runtime echo of
+    // the FFT<N> static_asserts — a rejected size returns false instead of
+    // failing to compile). On failure the object is left unallocated and
+    // every processing call is a no-op until a successful init().
+    bool init(int size) {
+        release();
+
+        if (size < 32 || size > SIGNALCORE_MAX_FFT_SIZE ||
+            (size & (size - 1)) != 0) {
+            return false;
+        }
+
+        samples_    = new float[size]();
+        result_     = new float[size]();
+        windowCoef_ = new float[size / 2]();
+
+        if (!samples_ || !result_ || !windowCoef_ ||
+            !detail::rfftFastInitF32(&fftStruct_, (uint16_t)size)) {
+            release();
+            return false;
+        }
+
+        size_ = size;
+        return true;
+    }
+
+    // Current transform length, or 0 before the first successful init().
+    int size() const { return size_; }
+
+    // Access the magnitude spectrum computed by the last calculate()/forward().
+    // Only result[0 .. size/2] are meaningful; same contract as FFT<N>.
+    operator float*() { return result_; }
+
+    // Select the analysis window. `size` must match the sample count later
+    // passed to calculate(); 0 (the default) means the full FFT length.
+    // Values above the FFT length are clamped: the coefficient buffer holds
+    // size/2 entries. Must be re-called after init() — resizing discards the
+    // coefficients.
+    void setWindowType(WindowType wt, uint32_t size = 0) {
+        if (!windowCoef_) return;
+        if (size == 0 || size > (uint32_t)size_) size = (uint32_t)size_;
+        windowType_ = wt;
+        windowSum_  = createWindowCoefficients(windowCoef_, size, wt);
+    }
+
+    // The calculate() overloads copy `size` samples in, zero-pad to the FFT
+    // length, window, transform, and scale — same contract and caveats as
+    // FFT<N>::calculate(). `size` < 0 (the default) means a full buffer.
+    void calculate(uint16_t* source, int size = -1) {
+        if (!samples_ || !result_) return;
+        int n = clampInputSize(size);
+        for (int i = 0; i < n; i++) samples_[i] = (float)source[i];
+        for (int i = n; i < size_; i++) samples_[i] = 0.0f;
+        forward(n);
+    }
+
+    void calculate(int16_t* source, int size = -1) {
+        if (!samples_ || !result_) return;
+        int n = clampInputSize(size);
+        for (int i = 0; i < n; i++) samples_[i] = (float)source[i];
+        for (int i = n; i < size_; i++) samples_[i] = 0.0f;
+        forward(n);
+    }
+
+    void calculate(float* source, int size = -1) {
+        if (!samples_ || !result_) return;
+        int n = clampInputSize(size);
+        for (int i = 0; i < n; i++) samples_[i] = source[i];
+        for (int i = n; i < size_; i++) samples_[i] = 0.0f;
+        forward(n);
+    }
+
+    void forward(int size) {
+        if (!samples_ || !result_) return;
+
+        if (windowType_ != WindowType::None && windowType_ != WindowType::Rectangle) {
+            for (int i = 0; i < size / 2; i++) {
+                samples_[i] = samples_[i] * windowCoef_[i];
+                samples_[size - (i + 1)] = samples_[size - (i + 1)] * windowCoef_[i];
+            }
+        }
+
+        detail::rfftFastF32(&fftStruct_, samples_, result_, 0);
+
+        // Identical scaling to FFT<N>::forward(): single-sided 2/sum(w)
+        // amplitude correction, with DC and Nyquist skipping the x2 because
+        // they have no negative-frequency twin.
+        if (windowSum_ == 0.0f) windowSum_ = (float)(size_ / 2);
+        float scale = windowSum_;
+
+        float DC      = fabsf(result_[0]) / (scale * 2.0f);
+        float nyquist = fabsf(result_[1]) / (scale * 2.0f);
+
+        detail::cmplxMagF32(result_, result_, (size_ / 2));
+
+        for (int i = 0; i < (size_ / 2); i++) {
+            result_[i] = result_[i] / scale;
+        }
+
+        result_[0]         = DC;
+        result_[size_ / 2] = nyquist;
+    }
+
+    // Convert result[0..size/2] in place from linear magnitude to dB, as
+    // FFT<N>::postScaleDB() does, with one addition: the clamp ceiling is a
+    // parameter. Boards whose ADC full scale sits above the display
+    // reference need a ceiling other than +10 dB (e.g. +10.37 dBV for a
+    // 3.3 Vpp ADC against a 1.0 Vpp reference, 0 dBV when full scale equals
+    // the reference).
+    void postScaleDB(float floor = -100.0f, float maxScale = 32767.0f, float ceiling = 10.0f) {
+        if (!result_) return;
+        for (int i = 0; i <= (size_ / 2); i++) {
+            result_[i] = constrain(20.0f * log10f(result_[i] / maxScale), floor, ceiling);
+        }
+    }
+
+    // Same contract as postScaleDB() with the polynomial log approximation
+    // (~0.01 dB error) for platforms where log10f is expensive.
+    void postScaleDBFast(float floor = -100.0f, float maxScale = 32767.0f, float ceiling = 10.0f) {
+        if (!result_) return;
+        for (int i = 0; i <= (size_ / 2); i++) {
+            result_[i] = constrain(20.0f * log10fFast(result_[i] / maxScale), floor, ceiling);
+        }
+    }
+
+    // Add a per-bin correction to the spectrum in place. The correction and
+    // the spectrum must be in the same domain — typically dB offsets applied
+    // after postScaleDB(), which is how a stored flatness calibration is
+    // applied. numBins is clamped to the valid bin count.
+    void applyCalibration(const float* calibrationData, size_t numBins) {
+        if (!result_) return;
+        size_t maxBins = (size_t)(size_ / 2) + 1;
+        if (numBins > maxBins) numBins = maxBins;
+        for (size_t i = 0; i < numBins; i++) {
+            result_[i] += calibrationData[i];
+        }
+    }
+
+    // Index of the dominant magnitude bin; same contract as FFT<N>::peakBin().
+    int peakBin(bool skipDC = true) {
+        if (!result_) return 0;
+        return findPeak(result_, (size_ / 2) + 1, skipDC ? 1 : 0);
+    }
+
+    // Frequency of the dominant bin in Hz; same contract as
+    // FFT<N>::peakFrequency().
+    float peakFrequency(float sampleRate, bool skipDC = true) {
+        if (size_ == 0) return 0.0f;
+        return (float)peakBin(skipDC) * sampleRate / (float)size_;
+    }
+
+private:
+    int clampInputSize(int size) const {
+        if (size < 0 || size > size_) return size_;
+        return size;
+    }
+
+    void release() {
+        delete[] samples_;
+        delete[] result_;
+        delete[] windowCoef_;
+        samples_ = result_ = windowCoef_ = nullptr;
+        size_       = 0;
+        windowType_ = WindowType::None;
+        windowSum_  = 0.0f;
+    }
+
+    detail::RFFTInstanceF32 fftStruct_;
+    int         size_        = 0;
+    float*      samples_     = nullptr;
+    float*      result_      = nullptr;
+    float*      windowCoef_  = nullptr;
+    WindowType  windowType_  = WindowType::None;
+    float       windowSum_   = 0.0f;
 };
 
 } // namespace signalcore
