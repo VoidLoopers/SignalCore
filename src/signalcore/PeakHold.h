@@ -50,6 +50,7 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <new>
 
 
 namespace signalcore {
@@ -61,8 +62,8 @@ public:
     // sampleWeight, which is the fraction given to the NEW sample:
     // decay = 1 - sampleWeight.
     PeakHoldProcessor(size_t size, float decay = 0.95f, bool isActive = true)
-        : active(isActive), size_(size), result_(new float[size]()), decay_(decay) {
-        reset();
+        : active(isActive), size_(0), result_(nullptr), decay_(decay) {
+        init(size);
     }
 
     ~PeakHoldProcessor() {
@@ -70,9 +71,10 @@ public:
     }
 
     // Owns a heap buffer of size * sizeof(float) bytes. Copying is disabled:
-    // two copies sharing one buffer would double-delete it. On RAM-limited
-    // boards note that `new` failure is not checked — construct once at
-    // startup and reuse via init() rather than allocating per frame.
+    // two copies sharing one buffer would double-delete it. On a failed
+    // allocation the processor degrades to size() == 0 (update() becomes a
+    // no-op) instead of faulting: with -fno-exceptions a failed new[]
+    // returns nullptr, and the value-init form would zero-fill through it.
     PeakHoldProcessor(const PeakHoldProcessor&)            = delete;
     PeakHoldProcessor& operator=(const PeakHoldProcessor&) = delete;
 
@@ -87,8 +89,8 @@ public:
 
     inline void init(size_t newSize) {
         delete[] result_;
-        size_   = newSize;
-        result_ = new float[size_]();
+        result_ = new (std::nothrow) float[newSize];
+        size_   = result_ ? newSize : 0;
         reset();
     }
 

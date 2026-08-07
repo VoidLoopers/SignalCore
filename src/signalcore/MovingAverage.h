@@ -50,6 +50,7 @@
 
 #include <stddef.h>
 #include <string.h>
+#include <new>
 
 
 namespace signalcore {
@@ -61,8 +62,8 @@ public:
     // decay, which is the fraction kept from the OLD value:
     // sampleWeight = 1 - decay.
     ExponentialMovingAverage(size_t size, float sampleWeight = 0.2f, bool isActive = true)
-        : active(isActive), size_(size), sampleWeight_(sampleWeight), result_(nullptr), reinit_(true) {
-        result_ = new float[size_]();
+        : active(isActive), size_(0), sampleWeight_(sampleWeight), result_(nullptr), reinit_(true) {
+        init(size);
     }
 
     ~ExponentialMovingAverage() {
@@ -70,16 +71,18 @@ public:
     }
 
     // Owns a heap buffer of size * sizeof(float) bytes. Copying is disabled:
-    // two copies sharing one buffer would double-delete it. On RAM-limited
-    // boards note that `new` failure is not checked — construct once at
-    // startup and reuse via init() rather than allocating per frame.
+    // two copies sharing one buffer would double-delete it. On a failed
+    // allocation the processor degrades to size() == 0 (update() becomes a
+    // no-op) instead of faulting: with -fno-exceptions a failed new[]
+    // returns nullptr, and the value-init form would zero-fill through it.
     ExponentialMovingAverage(const ExponentialMovingAverage&)            = delete;
     ExponentialMovingAverage& operator=(const ExponentialMovingAverage&) = delete;
 
     inline void init(size_t newSize) {
         delete[] result_;
-        size_   = newSize;
-        result_ = new float[size_]();
+        result_ = new (std::nothrow) float[newSize];
+        size_   = result_ ? newSize : 0;
+        if (result_) memset(result_, 0, newSize * sizeof(float));
         reinit_ = true;
     }
 

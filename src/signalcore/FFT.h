@@ -58,6 +58,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <new>
 #include <float.h>
 #include <stdint.h>
 
@@ -548,15 +549,24 @@ public:
             return false;
         }
 
-        samples_    = new float[size]();
-        result_     = new float[size]();
-        windowCoef_ = new float[size / 2]();
+        // nothrow, and zero only AFTER the null check: with -fno-exceptions
+        // a failed plain new[] returns nullptr, and the value-init form
+        // `new float[n]()` zero-fills through that nullptr before any check
+        // can run — on a heap-tight build that is a hard fault (nullptr
+        // DACCVIOL + reboot), not the promised false return.
+        samples_    = new (std::nothrow) float[size];
+        result_     = new (std::nothrow) float[size];
+        windowCoef_ = new (std::nothrow) float[size / 2];
 
         if (!samples_ || !result_ || !windowCoef_ ||
             !detail::rfftFastInitF32(&fftStruct_, (uint16_t)size)) {
             release();
             return false;
         }
+
+        memset(samples_,    0, (size_t)size * sizeof(float));
+        memset(result_,     0, (size_t)size * sizeof(float));
+        memset(windowCoef_, 0, (size_t)(size / 2) * sizeof(float));
 
         size_ = size;
         return true;
