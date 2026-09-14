@@ -26,6 +26,9 @@
  *   - Trigger.h        — rising/falling edge trigger with hysteresis
  *   - PeakHold.h       — per-bin peak-hold with exponential decay
  *   - MovingAverage.h  — ExponentialMovingAverage for vector smoothing
+ *   - measure/SineMetrics.h — ADC sine-wave metrics (SINAD, ENOB, SNR, THD,
+ *                        SFDR per MT-003) from a raw-code record, in
+ *                        namespace signalcore::measure
  *
  * Everything lives in namespace signalcore. The conventional sketch pattern
  * is `using namespace signalcore;` after the include.
@@ -80,5 +83,6 @@
 #include "signalcore/Trigger.h"
 #include "signalcore/PeakHold.h"
 #include "signalcore/MovingAverage.h"
+#include "measure/SineMetrics.h"
 
 #endif // _SIGNALCORE_H_

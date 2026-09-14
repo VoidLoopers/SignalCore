@@ -311,6 +311,33 @@ the other. `PeakHoldProcessor` and `ExponentialMovingAverage` allocate their
 arrays when constructed, so on a RAM-tight board create them once in `setup()` at
 the size you need rather than resizing in the loop.
 
+### Measuring a converter: SINAD, ENOB, SFDR
+
+`measure/SineMetrics.h` (namespace `signalcore::measure`) turns one record
+of raw ADC codes containing a sine wave into the MT-003 figures of merit,
+with the math done in double on the board:
+
+```cpp
+using namespace signalcore::measure;
+RecordMeta meta = {797872.34, 12, 805.9, 1000.0};   // fs, bits, uV/LSB, tone hint (0 = find)
+Options opt;                                        // Blackman-Harris 4-term, H2..H6
+static double work[8192 + 4097];                    // workspaceDoubles(8192)
+Result r = analyze(codes, 8192, meta, opt, work);
+if (r.valid) Serial.printf("SINAD %.2f dB  ENOB %.2f (FS)  SFDR %.1f dBc\n",
+                           r.sinadDb, r.enobFullScale, r.spec.sfdrDbc);
+```
+
+Two estimators run on the same record: a windowed FFT (Hann, Blackman-Harris
+4-term, Nuttall 4-term, or Blackman-Harris 7-term) with the coherent-gain and
+noise-bandwidth corrections applied and the DC and fundamental lobes excluded,
+and a three-parameter least-squares sine fit that needs no window at all.
+Agreement between the two SINAD values is the built-in check of the window
+corrections, and `r.flags` says why a record was rejected (clipping, too
+short, dropped samples, a wrong hint) instead of returning a wrong number.
+`Aggregate` folds K records into mean/min/max, and `reportRecord()` prints
+the full table. `test/host/test_sine_metrics.cpp` is the synthetic
+validation matrix.
+
 ## Configuration and platforms
 
 SignalCore needs almost no configuration. The defaults adapt to the target board
