@@ -8,7 +8,8 @@
  * loop, which saves half the storage.
  *
  * Supported windows: rectangle, Hamming, Hann, triangle (Bartlett), Nuttall,
- * Blackman, Blackman-Nuttall, Blackman-Harris, flat-top, and Welch.
+ * Blackman, Blackman-Nuttall, Blackman-Harris, flat-top, Welch, and the
+ * 7-term Blackman-Harris (Albrecht).
  *
  * Platform: Any Arduino-compatible board (pure C++ math, no hardware dependencies)
  *
@@ -78,6 +79,7 @@ enum class WindowType : uint8_t {
     BlackmanHarris,
     FlatTop,
     Welch,
+    BlackmanHarris7,
 };
 
 
@@ -94,6 +96,7 @@ constexpr const char* getWindowNameAbbr(WindowType win) {
            win == WindowType::BlackmanHarris   ? "Blk-Har" :
            win == WindowType::FlatTop          ? "FltTop"  :
            win == WindowType::Welch            ? "Welch"   :
+           win == WindowType::BlackmanHarris7  ? "BH7"     :
                                                  "Unknown";
 }
 
@@ -112,7 +115,79 @@ constexpr const char* getWindowName(WindowType win, bool abbr = false) {
            win == WindowType::BlackmanHarris   ? "Blackman-Harris"  :
            win == WindowType::FlatTop          ? "Flat Top"         :
            win == WindowType::Welch            ? "Welch"            :
+           win == WindowType::BlackmanHarris7  ? "Blackman-Harris 7":
                                                  "Unknown";
+}
+
+
+// Double-precision cosine-series coefficient tables, shared by the float
+// display path below (createWindowCoefficients) and by measure/SineMetrics.h,
+// which needs double precision and its own periodic-form evaluation. lobeBins
+// is the main-lobe half-width in bins, used by SineMetrics as a mask radius.
+struct CosineSeries {
+    const double* a;
+    uint8_t terms;
+    uint8_t lobeBins;
+};
+
+namespace detail {
+    static const double kHamming[]         = {0.54, 0.46};
+    static const double kHann[]            = {0.5, 0.5};
+    static const double kNuttall[]         = {0.355768, 0.487396, 0.144232, 0.012604};
+    static const double kBlackman[]        = {0.42323, 0.49755, 0.07922};
+    static const double kBlackmanNuttall[] = {0.3635819, 0.4891775, 0.1365995, 0.0106411};
+    static const double kBlackmanHarris[]  = {0.35875, 0.48829, 0.14128, 0.01168};
+    static const double kFlatTop[]         = {0.2810639, 0.5208972, 0.1980399};
+    // Albrecht's 7-term Blackman-Harris, highest sidelobe about -180 dB.
+    static const double kBlackmanHarris7[] = {0.27105140069342, 0.43329793923448,
+                                              0.21812299954311, 0.06592544638803,
+                                              0.01081174209837, 0.00077658482522,
+                                              0.00001388721735};
+}
+
+// Look up the cosine-series coefficients for `w`. Returns false for windows
+// that are not a cosine series (None, Rectangle, Triangle, Welch) — those
+// have no `out` written.
+inline bool cosineSeries(WindowType w, CosineSeries& out) {
+    switch (w) {
+        case WindowType::Hamming:         out = {detail::kHamming, 2, 2};         return true;
+        case WindowType::Hann:            out = {detail::kHann, 2, 2};            return true;
+        case WindowType::Nuttall:         out = {detail::kNuttall, 4, 4};         return true;
+        case WindowType::Blackman:        out = {detail::kBlackman, 3, 3};        return true;
+        case WindowType::BlackmanNuttall: out = {detail::kBlackmanNuttall, 4, 4}; return true;
+        case WindowType::BlackmanHarris:  out = {detail::kBlackmanHarris, 4, 4};  return true;
+        case WindowType::FlatTop:         out = {detail::kFlatTop, 3, 3};         return true;
+        case WindowType::BlackmanHarris7: out = {detail::kBlackmanHarris7, 7, 7}; return true;
+        default:                          return false;
+    }
+}
+
+// Window value at cos(theta), theta the phase for the sample being
+// evaluated: w = a0 - a1 cos(theta) + a2 cos(2 theta) - ...
+// Evaluated with the Chebyshev recurrence cos((m+1)t) = 2 cos t cos(mt) - cos((m-1)t)
+// so each sample costs one cos() plus a few multiply-adds per term.
+//
+// NOTE: this evaluates the shape only — it says nothing about whether theta
+// steps through the symmetric (denominator size-1, used below by
+// createWindowCoefficients for the float display path) or periodic
+// (denominator N, used by measure/SineMetrics.h) convention. SineMetrics
+// uses the periodic form because that is what the host reference
+// utilities/adc_measure.py uses, and the compare gate between them is
+// bit-exact; the two conventions give slightly different coefficients near
+// the buffer edges and must not be swapped.
+inline double cosineSeriesValue(const CosineSeries& w, double cosTheta) {
+    double cm1 = 1.0;        // cos(0 t)
+    double c0  = cosTheta;   // cos(1 t)
+    double acc = w.a[0];
+    double sign = -1.0;
+    for (int m = 1; m < w.terms; ++m) {
+        acc += sign * w.a[m] * c0;
+        double c1 = 2.0 * cosTheta * c0 - cm1;
+        cm1 = c0;
+        c0 = c1;
+        sign = -sign;
+    }
+    return acc;
 }
 
 
@@ -137,49 +212,34 @@ inline float createWindowCoefficients(float* array, uint32_t size, WindowType wi
             case WindowType::Rectangle:
                 array[i] = 1.0f;
                 break;
-            case WindowType::Hamming:
-                array[i] = 0.54f - (0.46f * cosf((2.0f * (float)M_PI) * ratio));
-                break;
-            case WindowType::Hann:
-                // Hann peaks at 1.0 in the centre. The original SDSP copy
-                // used the Hamming coefficient here, which biased amplitude
-                // estimates by ~+0.67 dB. Corrected to 0.5.
-                array[i] = 0.5f * (1.0f - cosf((2.0f * (float)M_PI) * ratio));
-                break;
             case WindowType::Triangle:
                 array[i] = 1.0f - ((2.0f * fabsf((float)i - (numSamplesMinus1 / 2.0f))) / numSamplesMinus1);
                 break;
-            case WindowType::Nuttall:
-                array[i] = 0.355768f - (0.487396f * cosf((2.0f * (float)M_PI) * ratio))
-                                     + (0.144232f * cosf((4.0f * (float)M_PI) * ratio))
-                                     - (0.012604f * cosf((6.0f * (float)M_PI) * ratio));
+            case WindowType::Welch: {
+                float t = ((float)i - numSamplesMinus1 / 2.0f) / (numSamplesMinus1 / 2.0f);
+                array[i] = 1.0f - (t * t);
                 break;
+            }
+            case WindowType::Hamming:
+            case WindowType::Hann:
+            case WindowType::Nuttall:
             case WindowType::Blackman:
+            case WindowType::BlackmanNuttall:
+            case WindowType::BlackmanHarris:
+            case WindowType::FlatTop:
+            case WindowType::BlackmanHarris7: {
                 // Blackman/FlatTop coefficient sets follow the legacy SDSP
                 // tables, normalized so the window peaks at 1.0; they differ
                 // slightly from the textbook "classic Blackman"
                 // (0.42/0.50/0.08). FlatTop is a 3-term variant, not the
                 // common 5-term flat-top — expect a narrower main lobe.
-                array[i] = 0.42323f - (0.49755f * cosf((2.0f * (float)M_PI) * ratio))
-                                    + (0.07922f * cosf((4.0f * (float)M_PI) * ratio));
-                break;
-            case WindowType::BlackmanNuttall:
-                array[i] = 0.3635819f - (0.4891775f * cosf((2.0f * (float)M_PI) * ratio))
-                                      + (0.1365995f * cosf((4.0f * (float)M_PI) * ratio))
-                                      - (0.0106411f * cosf((6.0f * (float)M_PI) * ratio));
-                break;
-            case WindowType::BlackmanHarris:
-                array[i] = 0.35875f - (0.48829f * cosf((2.0f * (float)M_PI) * ratio))
-                                    + (0.14128f * cosf((4.0f * (float)M_PI) * ratio))
-                                    - (0.01168f * cosf((6.0f * (float)M_PI) * ratio));
-                break;
-            case WindowType::FlatTop:
-                array[i] = 0.2810639f - (0.5208972f * cosf((2.0f * (float)M_PI) * ratio))
-                                      + (0.1980399f * cosf((4.0f * (float)M_PI) * ratio));
-                break;
-            case WindowType::Welch: {
-                float t = ((float)i - numSamplesMinus1 / 2.0f) / (numSamplesMinus1 / 2.0f);
-                array[i] = 1.0f - (t * t);
+                // Hann peaks at 1.0 in the centre. The original SDSP copy
+                // used the Hamming coefficient here, which biased amplitude
+                // estimates by ~+0.67 dB. Corrected to 0.5.
+                CosineSeries cs;
+                cosineSeries(windowType, cs);
+                double theta = (2.0 * M_PI) * (double)ratio;
+                array[i] = (float)cosineSeriesValue(cs, cos(theta));
                 break;
             }
         }

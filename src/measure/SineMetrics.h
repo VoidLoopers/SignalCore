@@ -69,70 +69,60 @@
 #include <stdio.h>
 #include <algorithm>
 
+#include "../signalcore/Windows.h"
+
 namespace signalcore {
 namespace measure {
 
 // ---------------------------------------------------------------------------
 // Windows
 // ---------------------------------------------------------------------------
+//
+// The window shapes (coefficients, lobe widths) live in signalcore::Windows.h
+// as the single source of truth; this header only adds the serial-protocol
+// name strings ("hann", "bh4", "nuttall4", "bh7") and the wiring to run
+// Windows.h's cosine-series tables through the periodic-form FFT below.
+// "nuttall4" is a protocol-level name for the WindowType::BlackmanNuttall
+// coefficients, not WindowType::Nuttall (Windows.h keeps those as two
+// distinct, differently-tapered windows; the wire format only ever asked
+// for the Blackman-Nuttall one, so the old name stays).
+using signalcore::WindowType;
+using signalcore::CosineSeries;
+using signalcore::cosineSeries;
+using signalcore::cosineSeriesValue;
 
-enum WindowKind : uint8_t {
-    WINDOW_HANN = 0,      // 2-term, main lobe +/-2 bins, -31 dB sidelobes
-    WINDOW_BH4,           // 4-term Blackman-Harris, +/-4 bins, -92 dB
-    WINDOW_NUTTALL4,      // 4-term Nuttall, +/-4 bins, -93 dB
-    WINDOW_BH7,           // 7-term Blackman-Harris (Albrecht), +/-7 bins, -180 dB
-    WINDOW_COUNT
-};
-
-struct WindowSpec {
-    const double* a;      // cosine-series coefficients a0..a(terms-1)
-    int terms;            // number of terms
-    int lobeBins;         // half-width of the main lobe in bins (mask radius)
-    const char* name;
-};
-
-namespace detail {
-    // Coefficients are the same ones utilities/adc_measure.py uses, so the
-    // host reference and this core see identical windows.
-    static const double kHann[]     = {0.5, 0.5};
-    static const double kBH4[]      = {0.35875, 0.48829, 0.14128, 0.01168};
-    static const double kNuttall4[] = {0.3635819, 0.4891775, 0.1365995, 0.0106411};
-    // Albrecht's 7-term Blackman-Harris, highest sidelobe about -180 dB.
-    static const double kBH7[]      = {0.27105140069342, 0.43329793923448,
-                                       0.21812299954311, 0.06592544638803,
-                                       0.01081174209837, 0.00077658482522,
-                                       0.00001388721735};
-}
-
-inline WindowSpec windowSpec(WindowKind kind) {
-    switch (kind) {
-        case WINDOW_HANN:     { WindowSpec s = {detail::kHann, 2, 2, "hann"};         return s; }
-        case WINDOW_NUTTALL4: { WindowSpec s = {detail::kNuttall4, 4, 4, "nuttall4"}; return s; }
-        case WINDOW_BH7:      { WindowSpec s = {detail::kBH7, 7, 7, "bh7"};           return s; }
-        case WINDOW_BH4:
-        default:              { WindowSpec s = {detail::kBH4, 4, 4, "bh4"};           return s; }
+// Short lower-case token used on the wire (MEAS? requests, sine_metrics_cli,
+// utilities/compare_sine_metrics.py and utilities/adc_measure.py all match
+// on these exact strings). Any other WindowType falls back to its
+// Windows.h abbreviation.
+inline const char* windowName(WindowType w) {
+    switch (w) {
+        case WindowType::Hann:            return "hann";
+        case WindowType::BlackmanHarris:  return "bh4";
+        case WindowType::BlackmanNuttall: return "nuttall4";
+        case WindowType::BlackmanHarris7: return "bh7";
+        default:                          return getWindowNameAbbr(w);
     }
 }
 
-inline const char* windowName(WindowKind kind) { return windowSpec(kind).name; }
+// Parse one of the four wire tokens above into a WindowType. Returns false
+// (leaving `out` untouched) for anything else.
+inline bool parseWindowName(const char* tok, WindowType& out) {
+    if (!strcmp(tok, "hann"))     { out = WindowType::Hann;            return true; }
+    if (!strcmp(tok, "bh4"))      { out = WindowType::BlackmanHarris;  return true; }
+    if (!strcmp(tok, "nuttall4")) { out = WindowType::BlackmanNuttall; return true; }
+    if (!strcmp(tok, "bh7"))      { out = WindowType::BlackmanHarris7; return true; }
+    return false;
+}
 
 // Window value at sample n of N (periodic form, denominator N):
 //   w[n] = a0 - a1 cos(2pi n/N) + a2 cos(4pi n/N) - ...
-// Evaluated with the Chebyshev recurrence cos((m+1)t) = 2 cos t cos(mt) - cos((m-1)t)
-// so each sample costs one cos() plus a few multiply-adds per term.
-inline double windowValue(const WindowSpec& w, double cosTheta) {
-    double cm1 = 1.0;        // cos(0 t)
-    double c0  = cosTheta;   // cos(1 t)
-    double acc = w.a[0];
-    double sign = -1.0;
-    for (int m = 1; m < w.terms; ++m) {
-        acc += sign * w.a[m] * c0;
-        double c1 = 2.0 * cosTheta * c0 - cm1;
-        cm1 = c0;
-        c0 = c1;
-        sign = -sign;
-    }
-    return acc;
+// See signalcore::cosineSeriesValue for the recurrence; this measurement
+// path always uses the periodic form (matches utilities/adc_measure.py,
+// the compare gate is bit-exact), never the symmetric form Windows.h's
+// float display path (createWindowCoefficients) uses.
+inline double windowValue(const CosineSeries& w, double cosTheta) {
+    return cosineSeriesValue(w, cosTheta);
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +160,7 @@ struct RecordMeta {
 };
 
 struct Options {
-    WindowKind window;
+    WindowType window;
     int    maxHarmonic;          // highest harmonic counted (MT-003: 6)
     size_t minSamples;           // TOO_SHORT below this
     double minCycles;            // FEW_CYCLES below this
@@ -186,7 +176,7 @@ struct Options {
                                  // the fit always uses the whole record
 
     Options()
-        : window(WINDOW_BH4), maxHarmonic(6), minSamples(1024), minCycles(8.0),
+        : window(WindowType::BlackmanHarris), maxHarmonic(6), minSamples(1024), minCycles(8.0),
           minAmplitudeCodes(4.0), clipMarginCodes(0), spikeSigma(8.0),
           spikeFrac(0.15), tailGrowth(3.0), maxIterations(80),
           agreeToleranceDb(0.5), spurResolvedDb(12.0), maxFftLength(0) {}
@@ -642,7 +632,8 @@ inline bool analyzeSpectrum(const uint16_t* x, size_t n, const RecordMeta& meta,
     memset(&spec, 0, sizeof(spec));
     const size_t nfft = fftLengthFor(n, opt.maxFftLength);
     if (!x || !work || nfft == 0 || meta.fsHz <= 0.0) return false;
-    const WindowSpec win = windowSpec(opt.window);
+    CosineSeries win;
+    if (!cosineSeries(opt.window, win)) return false;   // not a cosine-series window
     const double fs = meta.fsHz;
     const size_t half = nfft / 2;
     double* power = work + nfft;
@@ -864,7 +855,9 @@ inline Result analyze(const uint16_t* x, size_t n, const RecordMeta& meta,
         if (analyzeSpectrum(x, n, m2, opt, dc, work, r.spec)) {
             r.specValid = true;
             if (r.spec.nfft != n) r.flags |= FLAG_SPECTRUM_TRUNCATED;
-            const int L = windowSpec(opt.window).lobeBins;
+            CosineSeries winL;
+            cosineSeries(opt.window, winL);
+            const int L = winL.lobeBins;
             if (r.spec.peakBin - L <= L) r.flags |= FLAG_LOBE_OVERLAP;
             for (int h = 2; h <= std::min(opt.maxHarmonic, 7); ++h)
                 if (!r.spec.harmonic[h].valid) { r.flags |= FLAG_HARMONIC_COLLISION; break; }
@@ -1021,8 +1014,10 @@ inline void reportRecord(const Result& r, const Options& opt, LineSink sink, voi
                      hl.valid ? "" : " (excluded: lobe collision)");
             sink(ctx, b);
         }
+        CosineSeries winR;
+        cosineSeries(opt.window, winR);
         snprintf(b, sizeof b, "window: coherent gain %.5f, ENBW %.4f bins, lobe +/-%d bins, bin %.3f Hz, nfft=%u",
-                 r.spec.coherentGain, r.spec.enbwBins, windowSpec(opt.window).lobeBins,
+                 r.spec.coherentGain, r.spec.enbwBins, winR.lobeBins,
                  r.spec.binHz, (unsigned)r.spec.nfft);
         sink(ctx, b);
         snprintf(b, sizeof b, "check:  fit SINAD %.2f dB vs FFT SINAD %.2f dB, difference %.3f dB (tolerance %.2f)",
