@@ -621,15 +621,32 @@ inline bool fitSine(const uint16_t* x, size_t n, double fs, double seedHz,
 // Spectrum estimator (windowed FFT, MT-003 bookkeeping)
 // ---------------------------------------------------------------------------
 
-// Run the windowed-FFT estimator on x[0..n). `dcCodes` is subtracted before
-// windowing (use the fitted DC so the DC lobe cannot swallow a low tone).
-// `work` must hold workspaceDoubles(n) doubles; the first nfft/2+1 entries of
-// work + nfft hold the bin powers (code^2) on return, useful for averaging.
-// Returns false if the workspace or record is unusable.
-inline bool analyzeSpectrum(const uint16_t* x, size_t n, const RecordMeta& meta,
-                            const Options& opt, double dcCodes, double* work,
-                            SpectrumResult& spec) {
-    memset(&spec, 0, sizeof(spec));
+// The estimator runs in two steps so that the same MT-003 bookkeeping can
+// serve one record's spectrum and the mean of several:
+//   computeBinPowers()  window, transform, normalise -> bin powers
+//   spectrumMetrics()   fundamental, masks, harmonics, spur, SINAD ...
+// analyzeSpectrum() is the two in sequence.
+
+// What computeBinPowers() learned about the transform it ran; spectrumMetrics()
+// needs it to size the lobes and PsdAverage keeps a copy.
+struct BinPowerInfo {
+    size_t nfft;          // samples transformed (power of two <= n)
+    double binHz;         // fs / nfft
+    double coherentGain;  // sum(w) / nfft
+    double enbwBins;      // nfft * sum(w^2) / sum(w)^2
+    WindowType window;
+};
+
+// Windowed bin powers of x[0..n). `dcCodes` is subtracted before windowing
+// (use the fitted DC so the DC lobe cannot swallow a low tone). `work` must
+// hold workspaceDoubles(n) doubles; on return the first nfft/2+1 entries of
+// work + nfft hold the bin powers in code^2: a sinusoid's lobe sums to
+// A^2/2, noise bins sum to the noise power in that band. Returns false if
+// the workspace or record is unusable.
+inline bool computeBinPowers(const uint16_t* x, size_t n, const RecordMeta& meta,
+                             const Options& opt, double dcCodes, double* work,
+                             BinPowerInfo& info) {
+    memset(&info, 0, sizeof(info));
     const size_t nfft = fftLengthFor(n, opt.maxFftLength);
     if (!x || !work || nfft == 0 || meta.fsHz <= 0.0) return false;
     CosineSeries win;
@@ -637,7 +654,6 @@ inline bool analyzeSpectrum(const uint16_t* x, size_t n, const RecordMeta& meta,
     const double fs = meta.fsHz;
     const size_t half = nfft / 2;
     double* power = work + nfft;
-
     // Window and pack: real samples 2k, 2k+1 become complex pair k.
     double sumW = 0.0, sumW2 = 0.0;
     const double theta = 2.0 * M_PI / (double)nfft;
@@ -664,10 +680,34 @@ inline bool analyzeSpectrum(const uint16_t* x, size_t n, const RecordMeta& meta,
         power[k] = d * power[k] * norm;
     }
 
-    spec.nfft = nfft;
-    spec.binHz = fs / (double)nfft;
-    spec.coherentGain = sumW / (double)nfft;
-    spec.enbwBins = (double)nfft * sumW2 / (sumW * sumW);
+    info.nfft = nfft;
+    info.binHz = fs / (double)nfft;
+    info.coherentGain = sumW / (double)nfft;
+    info.enbwBins = (double)nfft * sumW2 / (sumW * sumW);
+    info.window = opt.window;
+    return true;
+}
+
+// MT-003 bookkeeping on a bin-power array: one record's powers from
+// computeBinPowers(), or the mean of several (see SpectrumAverage.h).
+// `power` holds info.nfft/2 + 1 entries in code^2 and is not modified.
+// `scratch` must hold info.nfft doubles (the transform half of the
+// workspace is free once the powers exist). meta.fHintHz steers the
+// fundamental search as in analyzeSpectrum(). Returns false when no
+// fundamental can be found.
+inline bool spectrumMetrics(const double* power, const BinPowerInfo& info,
+                            const RecordMeta& meta, const Options& opt,
+                            double* scratch, SpectrumResult& spec) {
+    memset(&spec, 0, sizeof(spec));
+    if (!power || !scratch || info.nfft == 0 || meta.fsHz <= 0.0) return false;
+    CosineSeries win;
+    if (!cosineSeries(info.window, win)) return false;
+    const double fs = meta.fsHz;
+    const size_t half = info.nfft / 2;
+    spec.nfft = info.nfft;
+    spec.binHz = info.binHz;
+    spec.coherentGain = info.coherentGain;
+    spec.enbwBins = info.enbwBins;
     const int L = win.lobeBins;
 
     // Fundamental: largest bin outside the DC lobe, or nearest the hint.
@@ -757,7 +797,7 @@ inline bool analyzeSpectrum(const uint16_t* x, size_t n, const RecordMeta& meta,
     // transform half of the workspace (free once the powers exist), so the
     // bin-power array stays in order for the caller.
     {
-        double* tmp = work;                // nfft doubles, transform no longer needed
+        double* tmp = scratch;             // nfft doubles, transform no longer needed
         size_t cnt = 0;
         for (int k = dcHi + 1; k < (int)half; ++k) {
             if (k >= fLo && k <= fHi) continue;
@@ -780,6 +820,19 @@ inline bool analyzeSpectrum(const uint16_t* x, size_t n, const RecordMeta& meta,
     const double F = ldexp(1.0, meta.bits - 1);
     spec.sfdrDbfs = detail::db10((0.5 * F * F) / spurP);
     return true;
+}
+
+
+// Run the windowed-FFT estimator on x[0..n): computeBinPowers() followed by
+// spectrumMetrics(). The bin powers stay at work + nfft on return, which is
+// what the averaging in SpectrumAverage.h reads.
+inline bool analyzeSpectrum(const uint16_t* x, size_t n, const RecordMeta& meta,
+                            const Options& opt, double dcCodes, double* work,
+                            SpectrumResult& spec) {
+    memset(&spec, 0, sizeof(spec));
+    BinPowerInfo info;
+    if (!computeBinPowers(x, n, meta, opt, dcCodes, work, info)) return false;
+    return spectrumMetrics(work + info.nfft, info, meta, opt, work, spec);
 }
 
 // ---------------------------------------------------------------------------
