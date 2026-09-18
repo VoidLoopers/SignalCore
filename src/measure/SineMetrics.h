@@ -710,7 +710,10 @@ inline bool spectrumMetrics(const double* power, const BinPowerInfo& info,
     spec.enbwBins = info.enbwBins;
     const int L = win.lobeBins;
 
-    // Fundamental: largest bin outside the DC lobe, or nearest the hint.
+    // Fundamental: nearest the hint, else the largest bin above DC. The
+    // search includes the DC lobe: the caller has removed the offset, and a
+    // tone only a few bins up (1 kHz in a 2048-point transform at 800 kSPS
+    // is bin 2.6) would otherwise lose to the largest spur.
     int peak = -1;
     if (meta.fHintHz > 0.0) {
         int kh = (int)floor(meta.fHintHz / spec.binHz + 0.5);
@@ -720,7 +723,7 @@ inline bool spectrumMetrics(const double* power, const BinPowerInfo& info,
     }
     if (peak < 0) {
         double best = -1.0;
-        for (int k = L + 1; k < (int)half; ++k) if (power[k] > best) { best = power[k]; peak = k; }
+        for (int k = 1; k < (int)half; ++k) if (power[k] > best) { best = power[k]; peak = k; }
     }
     if (peak < 1) return false;
     spec.peakBin = peak;
