@@ -170,10 +170,12 @@ struct Options {
     double spikeFrac;
     double tailGrowth;           // RESIDUAL_GROWTH if tail rms > tailGrowth * head rms
     int    maxIterations;        // frequency refinement cap
-    double agreeToleranceDb;     // fit-vs-FFT SINAD agreement bound
+    double agreeToleranceDb;     // fit-vs-FFT SINAD agreement bound at 8192 points (see agreeToleranceFor)
     double spurResolvedDb;       // spur must clear the noise median by this to be "resolved"
     size_t maxFftLength;         // cap on the transform length (0 = largest power of two <= n);
-                                 // the fit always uses the whole record
+                                 // the fit always uses the whole record, and its
+                                 // residual over the transform's span is what the
+                                 // agreement check compares
 
     Options()
         : window(WindowType::BlackmanHarris), maxHarmonic(6), minSamples(1024), minCycles(8.0),
@@ -191,6 +193,7 @@ struct FitResult {
     double S;             // (a^2 + b^2) / 2, code^2
     double R;             // residual power SS/n, code^2
     double sinadDb;       // 10 log10(S / R)
+    double spanSinadDb;   // the same over the first spanN samples only (the transform's span)
     double residRmsCodes;
     double residMaxCodes; // largest |e| over the record
     double headRmsCodes;  // residual rms over the first quarter (head-quarter fit)
@@ -516,11 +519,24 @@ inline double brentMinimize(const uint16_t* x, size_t n, double fs, double offse
 
 } // namespace detail
 
+// The agreement bound for a transform of nfft points. A windowed noise
+// estimate scatters as 1/sqrt(nfft), so the bound that suits 8192 points
+// rejects good records from a shorter transform (white noise alone: 6 % of
+// records at 2048 points against 0.5 dB). Options::agreeToleranceDb is the
+// bound at 8192 points and above; below that it widens by sqrt(8192/nfft).
+inline double agreeToleranceFor(const Options& opt, size_t nfft) {
+    if (nfft == 0 || nfft >= 8192) return opt.agreeToleranceDb;
+    return opt.agreeToleranceDb * sqrt(8192.0 / (double)nfft);
+}
+
 // Fit a sine to x[0..n) at sample rate fs, seeded at seedHz. The bracket is
 // +/- bracketBins * fs/n around the seed. Fills `fit` and returns true if
-// the normal equations were solvable.
+// the normal equations were solvable. spanN (0 = n) is the number of
+// leading samples a shorter transform covers: spanSinadDb is the residual
+// of this fit over those samples alone, so the agreement check compares
+// the two estimators on the same data.
 inline bool fitSine(const uint16_t* x, size_t n, double fs, double seedHz,
-                    double bracketBins, int maxIterations, FitResult& fit) {
+                    double bracketBins, int maxIterations, FitResult& fit, size_t spanN = 0) {
     memset(&fit, 0, sizeof(fit));
     if (!x || n < 8 || fs <= 0.0 || seedHz <= 0.0) return false;
     const double binHz = fs / (double)n;
@@ -573,7 +589,8 @@ inline bool fitSine(const uint16_t* x, size_t n, double fs, double seedHz,
         headOk = detail::solve(sh, ah, bh, ch);
     }
 
-    double ss = 0.0, ssHead = 0.0, ssTail = 0.0, emax = 0.0;
+    if (spanN == 0 || spanN > n) spanN = n;
+    double ss = 0.0, ssSpan = 0.0, ssHead = 0.0, ssTail = 0.0, emax = 0.0;
     const double dr = cos(w), di = sin(w);
     const double hr = cos(wh), hiw = sin(wh);
     double cr = 1.0, ci = 0.0, hcr = 1.0, hci = 0.0;
@@ -585,6 +602,7 @@ inline bool fitSine(const uint16_t* x, size_t n, double fs, double seedHz,
         const double xv = (double)x[i] - offset;
         const double e = xv - (a * cr + b * ci + c);
         ss += e * e;
+        if (i < spanN) ssSpan += e * e;
         if (headOk) {
             const double eh = xv - (ah * hcr + bh * hci + ch);
             const double ae = fabs(eh);
@@ -608,6 +626,7 @@ inline bool fitSine(const uint16_t* x, size_t n, double fs, double seedHz,
     fit.S = 0.5 * (a * a + b * b);
     fit.R = ss / (double)n;
     fit.sinadDb = detail::db10(fit.S / fit.R);
+    fit.spanSinadDb = detail::db10(fit.S / (ssSpan / (double)spanN));
     fit.residRmsCodes = sqrt(fit.R);
     fit.residMaxCodes = emax;
     fit.headRmsCodes = q ? sqrt(ssHead / (double)q) : 0.0;
@@ -888,7 +907,8 @@ inline Result analyze(const uint16_t* x, size_t n, const RecordMeta& meta,
         bracket = 2.5;
     }
 
-    bool fitOk = seed > 0.0 && fitSine(x, n, meta.fsHz, seed, bracket, opt.maxIterations, r.fit);
+    bool fitOk = seed > 0.0 && fitSine(x, n, meta.fsHz, seed, bracket, opt.maxIterations, r.fit,
+                                       fftLengthFor(n, opt.maxFftLength));
     if (!fitOk) {
         r.flags |= FLAG_NOT_CONVERGED;
     } else {
@@ -941,8 +961,8 @@ inline Result analyze(const uint16_t* x, size_t n, const RecordMeta& meta,
     }
     r.idealFftFloorDb = r.idealSnrDb + r.processGainDb;
     if (r.specValid && fitOk) {
-        r.fitFftDisagreeDb = fabs(r.spec.sinadDb - r.fit.sinadDb);
-        if (r.fitFftDisagreeDb > opt.agreeToleranceDb) r.flags |= FLAG_ESTIMATORS_DISAGREE;
+        r.fitFftDisagreeDb = fabs(r.spec.sinadDb - r.fit.spanSinadDb);
+        if (r.fitFftDisagreeDb > agreeToleranceFor(opt, r.spec.nfft)) r.flags |= FLAG_ESTIMATORS_DISAGREE;
     }
     if (r.ampCodes > 0.0) {
         r.inputDbfs = 20.0 * log10(r.ampCodes / F);
@@ -1077,7 +1097,7 @@ inline void reportRecord(const Result& r, const Options& opt, LineSink sink, voi
                  r.spec.binHz, (unsigned)r.spec.nfft);
         sink(ctx, b);
         snprintf(b, sizeof b, "check:  fit SINAD %.2f dB vs FFT SINAD %.2f dB, difference %.3f dB (tolerance %.2f)",
-                 r.fit.sinadDb, r.spec.sinadDb, r.fitFftDisagreeDb, opt.agreeToleranceDb);
+                 r.fit.spanSinadDb, r.spec.sinadDb, r.fitFftDisagreeDb, agreeToleranceFor(opt, r.spec.nfft));
         sink(ctx, b);
         snprintf(b, sizeof b, "ideal:  SNR %.2f dB for %u bits, FFT process gain %.2f dB, FFT floor %.2f dB below full scale",
                  r.idealSnrDb, r.meta.bits, r.processGainDb, r.idealFftFloorDb);
