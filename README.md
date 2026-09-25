@@ -119,7 +119,7 @@ different length, and the template and the buffer cannot drift apart:
 using namespace signalcore;
 
 #define SAMPLE_RATE 10000
-#define FFT_LENGTH  1024           // power of two, 32 up to 4096
+#define FFT_LENGTH  1024           // power of two, 32 up to the board cap (32768 on Teensy)
 
 FFT<FFT_LENGTH> fft;               // the transform, sized at compile time
 SignalGenerator sig(SAMPLE_RATE);
@@ -154,9 +154,11 @@ A few things worth knowing:
   also write the length directly as `FFT<1024>`, and a named form,
   `FFT<FFTSize::N1024>`, still works if you prefer it. All three name the same
   type.
-- **The size is fixed at compile time and must be a power of two** between 32 and
-  4096. A value that is not a power of two, such as `FFT<500>`, fails to compile
-  with a message saying why, rather than misbehaving at run time.
+- **The size is fixed at compile time and must be a power of two** from 32 up to
+  `SIGNALCORE_MAX_FFT_SIZE` (32768 on Teensy and most boards; see the board
+  limits below and the configuration table). A value that is not a power of two,
+  such as `FFT<500>`, fails to compile with a message saying why, rather than
+  misbehaving at run time.
 - **Reading the spectrum.** `peakBin()` and `peakFrequency()` hand back the
   dominant tone directly. To read the spectrum itself, treat the FFT object as a
   `float*` array, where only the first `N/2 + 1` entries hold real magnitude
