@@ -244,7 +244,7 @@ differences are that its buffers live on the heap and its size is set with
 DynamicFFT fft;
 
 void setup() {
-    fft.init(1024);                                 // power of two, 32 up to the platform cap
+    fft.init(1024);                                 // any power of two >= 32 the heap holds
     fft.setWindowType(WindowType::BlackmanHarris);  // set after every init()
 }
 
@@ -255,13 +255,41 @@ void changeResolution(int newSize) {
 ```
 
 `init()` returns `false` and leaves the object inert if the size is not a power
-of two, is outside the platform cap, or the heap allocation fails — before a
-successful `init()` every processing call is a safe no-op. Because each
-`init()` reallocates, prefer `FFT<N>` when the length never changes, and on
+of two or the heap allocation fails — before a successful `init()` every
+processing call is a safe no-op. There is no size cap: 8192, 16384 and 32768
+points work wherever the memory does (see the footprint table below). Because
+each `init()` reallocates, prefer `FFT<N>` when the length never changes, and on
 RAM-tight boards mind heap fragmentation just as with the streaming processors.
 `postScaleDB()` on `DynamicFFT` also accepts a third `ceiling` argument for
 boards whose ADC full scale sits above the display reference (for example
 +10.37 dBV for a 3.3 Vpp ADC against a 1.0 Vpp reference).
+
+### The transform engine: `RealFFT<T>`
+
+`FFT<N>` and `DynamicFFT` both run on `signalcore::RealFFT<float>`
+(`signalcore/fft/RealFFT.h`), and a sketch that wants the raw complex bins
+without the magnitude and scaling steps can call it directly:
+
+```cpp
+RealFFT<float> fft;
+fft.init(8192);                      // allocates the twiddle table (n/4 + 1 floats)
+fft.forward(samples, bins);          // samples are undefined afterwards
+// bins[0] = DC, bins[1] = Nyquist, then [re, im] pairs for bins 1 .. n/2 - 1
+float p = bins[2 * k] * bins[2 * k] + bins[2 * k + 1] * bins[2 * k + 1];
+```
+
+The engine is chosen per instance from the size: on Teensy 4.x (or another
+ARM core with `SIGNALCORE_FORCE_CMSIS`) a `float` transform of 32 to 4096
+points runs CMSIS-DSP `arm_rfft_fast_f32`; every other case — `double`, sizes
+above 4096, and every non-CMSIS board — runs the generic radix-2 engine with
+twiddles from a quarter-wave table computed in double. Both give the same
+packing, and `backend()` reports which one ran. `init(n, table, count)` binds
+caller-owned table storage for code that must not allocate.
+
+Precision: the transform runs entirely in `T`. A float transform with table
+twiddles has a round-off floor near -150 dBFS per bin at 8192 points, far below
+any converter up to about 18 effective bits; `RealFFT<double>` exists for the
+20-bit class. Sums over bins belong in `double` either way.
 
 ### Signal generation
 
@@ -347,7 +375,7 @@ that behavior. Set them **before** `#include <SignalCore.h>`.
 | Macro | Default | What it controls |
 |---|---|---|
 | `SIGNALCORE_FORCE_CMSIS` | (off) | On a non-Teensy ARM core, switch to the CMSIS-DSP FFT backend. The switch is unconditional: if the core does not ship `arm_math.h` the build stops with a clear `#error`, and if the core ships the header but does not link the DSP objects, expect `arm_rfft_fast_*` linker errors. Ignored on non-ARM boards. |
-| `SIGNALCORE_MAX_FFT_SIZE` | 256 (AVR) · 1024 (ESP8266) · 4096 (other) | The largest FFT size the build will accept. The `FFT<>` template checks its size against this with a `static_assert`, so an oversized transform fails to compile instead of exhausting RAM at run time. Define it before the include to raise or lower the cap for your board. |
+| `SIGNALCORE_MAX_FFT_SIZE` | 256 (AVR) · 1024 (ESP8266) · 32768 (other) | The largest `FFT<N>` the build will compile. The template checks its size against this with a `static_assert`, so an oversized static instance fails to compile instead of exhausting RAM at run time. It guards `FFT<N>` only: `DynamicFFT` and `RealFFT` are limited by memory alone. Define it before the include to raise or lower the figure for your board. |
 
 ### Supported boards
 
@@ -364,25 +392,31 @@ that behavior. Set them **before** `#include <SignalCore.h>`.
 
 The generic backend produces the same output as the CMSIS backend, bin for bin
 (it matches the `arm_rfft_fast_f32` packing), so spectrum-analysis sketches behave
-the same across all of these boards.
+the same across all of these boards. CMSIS-DSP covers 32 to 4096 points; a
+transform above that runs the generic engine on every platform.
 
 ### Memory footprint
 
-`FFT<N>` reserves `2·N + N/2` floats statically. That memory is fixed at compile
-time and never comes from the heap. The three pieces are the input samples (N
-floats), the result buffer (N floats), and the half-window coefficients (N/2
-floats):
+`FFT<N>` reserves `2.75·N` floats statically. That memory is fixed at compile
+time and never comes from the heap. The four pieces are the input samples (N
+floats), the result buffer (N floats), the half-window coefficients (N/2
+floats) and the twiddle table (N/4 + 1 floats):
 
-| FFT size | Static RAM |
+| FFT size | RAM |
 |---|---|
-| 256 | ~2.5 KB |
-| 512 | ~5 KB |
-| 1024 | ~10 KB |
-| 2048 | ~20 KB |
-| 4096 | ~40 KB |
+| 256 | ~2.75 KB |
+| 512 | ~5.5 KB |
+| 1024 | ~11 KB |
+| 2048 | ~22 KB |
+| 4096 | ~44 KB |
+| 8192 | ~88 KB |
+| 16384 | ~176 KB |
+| 32768 | ~352 KB |
 
-`DynamicFFT` needs the same `2·N + N/2` floats as `FFT<N>`, but takes them from
-the heap on each `init()` instead of reserving them statically.
+`DynamicFFT` needs the same `2.75·N` floats as `FFT<N>`, but takes them from
+the heap on each `init()` instead of reserving them statically. A bare
+`RealFFT<T>` holds only the twiddle table; its input and output buffers are the
+caller's.
 `PeakHoldProcessor` and `ExponentialMovingAverage` size their buffers when
 constructed, and they take that memory from the heap rather than reserving it
 statically. On a RAM-tight board such as an AVR, create them once at the size you

@@ -86,18 +86,23 @@
 
 // --- Platform capability limits ---
 
-// Sketches may override the cap by defining SIGNALCORE_MAX_FFT_SIZE before
-// including SignalCore.h — the #ifndef guard is what makes that work.
+// The largest FFT<N> a build will compile. It guards the static instances
+// only: FFT<N> reserves 2.75 * N floats at compile time, so an oversized
+// template fails the static_assert instead of eating the board's RAM. The
+// runtime classes (DynamicFFT, RealFFT) ignore it and are limited by the
+// heap alone. Sketches may override the figure by defining
+// SIGNALCORE_MAX_FFT_SIZE before including SignalCore.h — the #ifndef
+// guard is what makes that work.
 #ifndef SIGNALCORE_MAX_FFT_SIZE
     #if defined(__AVR__)
         // The cap targets larger AVR parts (Mega 2560, 8 KB). An ATmega328
         // (UNO R3/Nano, 2 KB) cannot actually hold a 256-point FFT: the
-        // buffers alone need ~2.5 KB — FFT<128> is the practical ceiling.
+        // buffers alone need ~2.75 KB — FFT<128> is the practical ceiling.
         #define SIGNALCORE_MAX_FFT_SIZE 256
     #elif defined(ESP8266)
         #define SIGNALCORE_MAX_FFT_SIZE 1024
     #else
-        #define SIGNALCORE_MAX_FFT_SIZE 4096
+        #define SIGNALCORE_MAX_FFT_SIZE 32768
     #endif
 #endif
 
