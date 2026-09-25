@@ -20,6 +20,8 @@
  * Modules:
  *   - Platform.h       — board detection, phase wrapping, math fallbacks
  *   - Windows.h        — window functions and coefficient generation
+ *   - fft/RealFFT.h    — RealFFT<T>, the float or double real transform
+ *                        every other class runs on (CMSIS or generic)
  *   - FFT.h            — template FFT class, runtime-sized DynamicFFT, and
  *                        spectral helpers
  *   - DDS.h            — DDS oscillator and SignalGenerator
@@ -78,6 +80,7 @@
 
 #include "signalcore/Platform.h"
 #include "signalcore/Windows.h"
+#include "signalcore/fft/RealFFT.h"
 #include "signalcore/FFT.h"
 #include "signalcore/DDS.h"
 #include "signalcore/Trigger.h"
