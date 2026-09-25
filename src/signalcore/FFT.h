@@ -74,15 +74,25 @@ namespace signalcore {
 // convert to an integer, so FFT<FFTSize::N512> and FFT<512> name the same type,
 // and a plain integer (e.g. a FFT_LENGTH macro) can drive both the template
 // argument and an array declaration from a single source of truth.
+//
+// The names stop at 32768: that is the default SIGNALCORE_MAX_FFT_SIZE off
+// AVR and ESP8266, and the largest value the uint16_t base holds. On a board
+// with a lower cap the larger names still exist but fail the FFT<N>
+// static_assert. Sizes above 4096 run the generic engine on every platform
+// (CMSIS-DSP covers 32..4096), so expect the step in transform time there:
+// on a Teensy 4.1 about 0.3 ms at 4096 and 1.6 ms at 8192.
 enum FFTSize : uint16_t {
-    N32   = 32,
-    N64   = 64,
-    N128  = 128,
-    N256  = 256,
-    N512  = 512,
-    N1024 = 1024,
-    N2048 = 2048,
-    N4096 = 4096
+    N32    = 32,
+    N64    = 64,
+    N128   = 128,
+    N256   = 256,
+    N512   = 512,
+    N1024  = 1024,
+    N2048  = 2048,
+    N4096  = 4096,
+    N8192  = 8192,
+    N16384 = 16384,
+    N32768 = 32768
 };
 
 
