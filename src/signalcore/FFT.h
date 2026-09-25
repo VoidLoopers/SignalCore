@@ -3,11 +3,12 @@
  * @brief Cross-Platform FFT and Spectral Analysis
  *
  * Provides a template-based FFT class, a runtime-sized DynamicFFT variant,
- * and spectral analysis helpers. On ARM
- * platforms with CMSIS-DSP (Teensy 4.x by default, other ARM cores when
- * SIGNALCORE_FORCE_CMSIS is defined), uses hardware-accelerated
- * arm_rfft_fast_f32. On all other platforms, uses a portable radix-2
- * Cooley-Tukey implementation that produces identical output packing.
+ * and spectral analysis helpers. Both classes run on RealFFT<float>
+ * (fft/RealFFT.h), which picks its engine per instance: CMSIS-DSP
+ * arm_rfft_fast_f32 for 32..4096 points on Teensy 4.x (or other ARM cores
+ * with SIGNALCORE_FORCE_CMSIS), and the portable radix-2 engine with table
+ * twiddles for every other size and platform. The output packing is the
+ * same either way.
  *
  * Output format, in two stages:
  *   Raw transform packing (internal, matches CMSIS arm_rfft_fast_f32):
@@ -64,6 +65,7 @@
 
 #include "Platform.h"
 #include "Windows.h"
+#include "fft/RealFFT.h"
 
 
 namespace signalcore {
@@ -84,154 +86,16 @@ enum FFTSize : uint16_t {
 };
 
 
-// --- Backend selection: types and function bindings ---
+// --- Magnitude of interleaved complex pairs ---
 
 namespace detail {
 
 #if defined(SIGNALCORE_USE_CMSIS)
-
-// Close the namespaces before including the CMSIS headers: arm_math.h must
-// be parsed at global scope or the ARM symbols would be declared inside
-// signalcore::detail and fail to link. Reopened immediately below.
-} // namespace detail
-} // namespace signalcore
-
-#include "arm_math.h"
-#include "arm_const_structs.h"
-
-namespace signalcore {
-namespace detail {
-
-    typedef arm_rfft_fast_instance_f32 RFFTInstanceF32;
-
-    inline bool rfftFastInitF32(RFFTInstanceF32* S, uint16_t fftLen) {
-        return arm_rfft_fast_init_f32(S, fftLen) == ARM_MATH_SUCCESS;
-    }
-    inline void rfftFastF32(RFFTInstanceF32* S, float* pSrc, float* pDst, uint8_t ifftFlag) {
-        arm_rfft_fast_f32(S, pSrc, pDst, ifftFlag);
-    }
     inline void cmplxMagF32(float* pSrc, float* pDst, uint32_t numSamples) {
         arm_cmplx_mag_f32(pSrc, pDst, numSamples);
     }
-
-#else  // Generic C++ backend
-
-    struct RFFTInstanceF32 {
-        uint16_t fftLen;
-    };
-
-    // In-place radix-2 Cooley-Tukey complex FFT.
-    // data[] is interleaved complex: [re0, im0, re1, im1, ...], length = 2*N.
-    // N must be a power of 2.
-    inline void genericComplexFFT(float* data, int N) {
-        // Bit-reversal permutation
-        for (int i = 1, j = 0; i < N; i++) {
-            int bit = N >> 1;
-            while (j & bit) {
-                j ^= bit;
-                bit >>= 1;
-            }
-            j ^= bit;
-            if (i < j) {
-                float t;
-                t = data[2 * i];     data[2 * i]     = data[2 * j];     data[2 * j]     = t;
-                t = data[2 * i + 1]; data[2 * i + 1] = data[2 * j + 1]; data[2 * j + 1] = t;
-            }
-        }
-
-        // Butterfly stages
-        for (int len = 2; len <= N; len <<= 1) {
-            float angle = -2.0f * (float)M_PI / len;
-            float wrStep = cosf(angle);
-            float wiStep = sinf(angle);
-
-            for (int i = 0; i < N; i += len) {
-                float wr = 1.0f, wi = 0.0f;
-                for (int j = 0; j < len / 2; j++) {
-                    int u = 2 * (i + j);
-                    int v = 2 * (i + j + len / 2);
-
-                    float tr = wr * data[v] - wi * data[v + 1];
-                    float ti = wr * data[v + 1] + wi * data[v];
-
-                    data[v]     = data[u]     - tr;
-                    data[v + 1] = data[u + 1] - ti;
-                    data[u]     += tr;
-                    data[u + 1] += ti;
-
-                    float newWr = wr * wrStep - wi * wiStep;
-                    wi = wr * wiStep + wi * wrStep;
-                    wr = newWr;
-                }
-            }
-        }
-    }
-
-    inline bool rfftFastInitF32(RFFTInstanceF32* S, uint16_t fftLen) {
-        S->fftLen = fftLen;
-        return true;
-    }
-
-    // Real FFT of N samples using an N/2-point complex FFT. Output is packed
-    // in CMSIS arm_rfft_fast_f32 format. This generic version leaves pSrc
-    // intact, but the CMSIS backend clobbers it — the cross-backend contract
-    // is that pSrc is undefined after the call, so portable callers must use
-    // separate input and output buffers.
-    inline void rfftFastF32(RFFTInstanceF32* S, float* pSrc, float* pDst, uint8_t /*ifftFlag*/) {
-        int N = S->fftLen;
-        int M = N / 2;
-
-        memcpy(pDst, pSrc, N * sizeof(float));
-        genericComplexFFT(pDst, M);
-
-        float z0r = pDst[0];
-        float z0i = pDst[1];
-
-        // DC and Nyquist bins (both purely real for real input)
-        pDst[0] = z0r + z0i;
-        pDst[1] = z0r - z0i;
-
-        // Process conjugate-symmetric pairs: k and M-k share trig values
-        for (int k = 1; k < (M + 1) / 2; k++) {
-            int mk = M - k;
-
-            float zrk  = pDst[2 * k];
-            float zik  = pDst[2 * k + 1];
-            float zrmk = pDst[2 * mk];
-            float zimk = pDst[2 * mk + 1];
-
-            float er  =  0.5f * (zrk + zrmk);
-            float ei  =  0.5f * (zik - zimk);
-            float orC =  0.5f * (zik + zimk);
-            float oi  =  0.5f * (zrmk - zrk);
-
-            float angle = 2.0f * (float)M_PI * k / N;
-            float c = cosf(angle);
-            float s = sinf(angle);
-
-            pDst[2 * k]      = er + c * orC + s * oi;
-            pDst[2 * k + 1]  = ei + c * oi  - s * orC;
-
-            pDst[2 * mk]     =  er - c * orC - s * oi;
-            pDst[2 * mk + 1] = -ei + c * oi  - s * orC;
-        }
-
-        // k = M/2 is exact when M is a power of 2 (always the case here).
-        if (M % 2 == 0) {
-            int k = M / 2;
-            float zrk = pDst[2 * k];
-            float zik = pDst[2 * k + 1];
-
-            float angle = 2.0f * (float)M_PI * k / N;
-            float c = cosf(angle);
-            float s = sinf(angle);
-
-            pDst[2 * k]     = zrk + c * zik;
-            pDst[2 * k + 1] = -s * zik;
-        }
-    }
-
-    // Magnitude of interleaved complex pairs. Safe for in-place operation.
+#else
+    // Safe for in-place operation.
     inline void cmplxMagF32(float* pSrc, float* pDst, uint32_t numSamples) {
         for (uint32_t i = 0; i < numSamples; i++) {
             float re = pSrc[2 * i];
@@ -239,8 +103,7 @@ namespace detail {
             pDst[i] = sqrtf(re * re + im * im);
         }
     }
-
-#endif  // SIGNALCORE_USE_CMSIS
+#endif
 
 } // namespace detail
 
@@ -359,9 +222,10 @@ inline float ENOB(float* data, int size) {
 // separately.
 //
 // Memory: each instance embeds samples_[N] + result_[N] + windowCoef_[N/2]
-// = 2.5 * N floats (10 * N bytes): FFT<1024> ~ 10 KB, FFT<4096> ~ 40 KB.
-// Declare instances at global/static scope — a function-local FFT of any
-// real size will overflow the stack on embedded targets.
+// + twiddle_[N/4 + 1] = 2.75 * N floats (11 * N bytes): FFT<1024> ~ 11 KB,
+// FFT<4096> ~ 44 KB. Declare instances at global/static scope — a
+// function-local FFT of any real size will overflow the stack on embedded
+// targets.
 template<size_t FFT_LENGTH>
 class FFT {
 private:
@@ -371,19 +235,25 @@ private:
     // used to guarantee this; with a free integer parameter we check it here so
     // FFT<500> fails loudly at compile time instead of producing garbage.
     static_assert(FFT_LENGTH >= 32 && (FFT_LENGTH & (FFT_LENGTH - 1)) == 0,
-                  "FFT size must be a power of two >= 32 (32, 64, ... 4096)");
+                  "FFT size must be a power of two >= 32");
 
     // Catch oversized FFTs at compile time so a sketch does not burn the
     // entire RAM of an UNO trying to allocate a 4096-point transform. The
-    // limit lives in Platform.h: 256 for AVR, 1024 for ESP8266, 4096 elsewhere.
+    // limit lives in Platform.h: 256 for AVR, 1024 for ESP8266, 32768
+    // elsewhere; it guards these static instances only.
     static_assert(N <= SIGNALCORE_MAX_FFT_SIZE,
                   "FFT size exceeds SIGNALCORE_MAX_FFT_SIZE for this platform "
                   "(see src/signalcore/Platform.h)");
 
 public:
     FFT() : windowType_(WindowType::None), windowSum_(0.0f) {
-        detail::rfftFastInitF32(&fftStruct_, N);
+        // The twiddle table is a member, so the engine never allocates
+        // and this cannot fail for a valid N.
+        rfft_.init(N, twiddle_, sizeof(twiddle_) / sizeof(twiddle_[0]));
     }
+
+    // Which engine runs the transform (CMSIS or the generic radix-2).
+    RealFFT<float>::Backend backend() const { return rfft_.backend(); }
 
     // Access the magnitude spectrum computed by the last calculate()/forward().
     // Only result[0 .. N/2] are meaningful (N/2 + 1 bins: DC through Nyquist);
@@ -435,7 +305,7 @@ public:
             }
         }
 
-        detail::rfftFastF32(&fftStruct_, samples_, result_, 0);
+        rfft_.forward(samples_, result_);
 
         // Scale so a full-amplitude sine centered on a bin reads its
         // time-domain amplitude in the output (same units as the input).
@@ -505,7 +375,8 @@ public:
     }
 
 private:
-    detail::RFFTInstanceF32 fftStruct_;
+    RealFFT<float> rfft_;
+    float       twiddle_[N / 4 + 1];
     float       samples_[N];
     float       result_[N];
     WindowType  windowType_;
@@ -522,9 +393,11 @@ private:
 // length is known at compile time, prefer FFT<N>, which needs no heap and
 // cannot fail to allocate.
 //
-// Memory: buffers live on the heap — 2.5 * N floats (10 * N bytes) per
-// init(), re-allocated on every call. Nothing is allocated until the first
-// init(), and calculate()/forward() are safe no-ops before it.
+// Memory: buffers live on the heap — samples N + result N + window N/2 +
+// twiddles N/4 + 1 = 2.75 * N floats (11 * N bytes) per init(), re-allocated
+// on every call: 4096 -> 44 kB, 16384 -> 176 kB, 32768 -> 352 kB. Nothing is
+// allocated until the first init(), and calculate()/forward() are safe
+// no-ops before it. There is no size cap beyond what the heap holds.
 //
 // init() clears the window selection: coefficient length depends on the FFT
 // length, so call setWindowType() again after every (re)size.
@@ -537,15 +410,13 @@ public:
     }
 
     // Size the transform, allocating the internal buffers. `size` must be a
-    // power of two >= 32 and <= SIGNALCORE_MAX_FFT_SIZE (a runtime echo of
-    // the FFT<N> static_asserts — a rejected size returns false instead of
-    // failing to compile). On failure the object is left unallocated and
+    // power of two >= 32; a rejected size returns false. On failure,
+    // including a refused allocation, the object is left unallocated and
     // every processing call is a no-op until a successful init().
     bool init(int size) {
         release();
 
-        if (size < 32 || size > SIGNALCORE_MAX_FFT_SIZE ||
-            (size & (size - 1)) != 0) {
+        if (size < 32 || (size & (size - 1)) != 0) {
             return false;
         }
 
@@ -559,7 +430,7 @@ public:
         windowCoef_ = new (std::nothrow) float[size / 2];
 
         if (!samples_ || !result_ || !windowCoef_ ||
-            !detail::rfftFastInitF32(&fftStruct_, (uint16_t)size)) {
+            !rfft_.init((uint32_t)size)) {
             release();
             return false;
         }
@@ -574,6 +445,10 @@ public:
 
     // Current transform length, or 0 before the first successful init().
     int size() const { return size_; }
+
+    // Which engine runs the transform (CMSIS up to 4096 points on a CMSIS
+    // platform, the generic radix-2 otherwise).
+    RealFFT<float>::Backend backend() const { return rfft_.backend(); }
 
     // Access the magnitude spectrum computed by the last calculate()/forward().
     // Only result[0 .. size/2] are meaningful; same contract as FFT<N>.
@@ -628,7 +503,7 @@ public:
             }
         }
 
-        detail::rfftFastF32(&fftStruct_, samples_, result_, 0);
+        rfft_.forward(samples_, result_);
 
         // Identical scaling to FFT<N>::forward(): single-sided 2/sum(w)
         // amplitude correction, with DC and Nyquist skipping the x2 because
@@ -707,13 +582,14 @@ private:
         delete[] samples_;
         delete[] result_;
         delete[] windowCoef_;
+        rfft_.init(0);   // frees the twiddle table, size() -> 0
         samples_ = result_ = windowCoef_ = nullptr;
         size_       = 0;
         windowType_ = WindowType::None;
         windowSum_  = 0.0f;
     }
 
-    detail::RFFTInstanceF32 fftStruct_;
+    RealFFT<float> rfft_;
     int         size_        = 0;
     float*      samples_     = nullptr;
     float*      result_      = nullptr;
