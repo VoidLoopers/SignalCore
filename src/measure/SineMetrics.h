@@ -9,9 +9,13 @@
  *   SINAD   signal power over everything else in DC..fs/2 (DC excluded)
  *   ENOB    (SINAD - 1.76) / 6.02, at the measured input level and
  *           normalized to full scale (MT-003 eq. 2)
- *   SNR     signal over noise with the harmonics H2..H6 removed
- *   THD     harmonics H2..H6 over signal (reported as a negative dBc level)
+ *   SNR     signal over noise with the harmonics H2..Hmax removed
+ *   THD     harmonics H2..Hmax over signal (reported as a negative dBc level)
  *   SFDR    signal over the largest spur, in dBc and dBFS
+ *
+ * Hmax is Options::maxHarmonic: 6 by default (MT-003), up to 10. Every
+ * harmonic counts toward THD whether or not it stands above the noise
+ * (IEEE 1241 practice); HarmonicLine::resolved says which ones do.
  *
  * Two independent estimators run on the same record:
  *
@@ -26,11 +30,31 @@
  *      same record is the built-in check of the window corrections.
  *
  * The record is never modified and no memory is allocated here. The FFT
- * path needs a caller-supplied workspace (see workspaceDoubles()); the fit
- * needs about 1 kB of stack. All accumulation is in double.
+ * path needs a caller-supplied workspace (see workspaceReals()); the fit
+ * needs about 1 kB of stack.
  *
- * Portable C++11: no Arduino, no VoidLoopEngine, no CMSIS dependency. The
- * same header runs on the host test rig and on the target.
+ * Precision: the transform is signalcore::RealFFT<SpectrumReal>, the shared
+ * engine every SignalCore class uses. SpectrumReal is float unless the
+ * build defines SIGNALCORE_SINEMETRICS_DOUBLE_FFT to 1. The windowed
+ * samples, the transform and the per-bin powers are SpectrumReal; every
+ * accumulation (window sums, lobe and noise sums, medians' inputs aside,
+ * the spectrum average, the sine fit) is double. A float transform with
+ * table twiddles has a round-off floor near -150 dBFS per bin, far below
+ * any converter up to about 18 effective bits; the double build exists for
+ * the 20-bit class.
+ *
+ * Workspace layout, in SpectrumReal, for a transform of nfft points:
+ *   [0, nfft)                       windowed input, then free scratch
+ *   [nfft, nfft + nfft/2 + 1)       bin powers in code^2 (kept for the caller)
+ *   [.., + nfft)                    transform output (CMSIS packing)
+ *   [.., + nfft/4 + 1)              twiddle table
+ * About 2.75 nfft entries: 11 bytes per sample at float against the 12 of
+ * the earlier all-double workspace, and 22 at double.
+ *
+ * Portable C++11: no Arduino, no VoidLoopEngine dependency. The same header
+ * runs on the host test rig and on the target; on a CMSIS platform a float
+ * transform of 32..4096 points runs CMSIS-DSP, every other case the generic
+ * engine.
  *
  * Record contract: one contiguous capture at a single sample rate. Records
  * assembled from several DMA fills, or with dropped samples, produce a
@@ -70,6 +94,7 @@
 #include <algorithm>
 
 #include "../signalcore/Windows.h"
+#include "../signalcore/fft/RealFFT.h"
 
 namespace signalcore {
 namespace measure {
@@ -90,6 +115,14 @@ using signalcore::WindowType;
 using signalcore::CosineSeries;
 using signalcore::cosineSeries;
 using signalcore::cosineSeriesValue;
+
+// The transform's element type: float by default, double when the build
+// defines SIGNALCORE_SINEMETRICS_DOUBLE_FFT to 1 (see the header comment).
+#if defined(SIGNALCORE_SINEMETRICS_DOUBLE_FFT) && SIGNALCORE_SINEMETRICS_DOUBLE_FFT
+typedef double SpectrumReal;
+#else
+typedef float SpectrumReal;
+#endif
 
 // Short lower-case token used on the wire (MEAS? requests, sine_metrics_cli,
 // utilities/compare_sine_metrics.py and utilities/adc_measure.py all match
@@ -146,7 +179,7 @@ enum ResultFlag : uint32_t {
     FLAG_NO_SPECTRUM     = 1u << 16,  // FFT skipped: no workspace supplied
     FLAG_SPECTRUM_TRUNCATED = 1u << 17, // n not a power of two; FFT used the first 2^k samples
     FLAG_LOBE_OVERLAP    = 1u << 18,  // fundamental lobe overlaps the DC lobe
-    FLAG_HARMONIC_COLLISION = 1u << 19, // at least one of H2..H6 was excluded (folded onto another lobe)
+    FLAG_HARMONIC_COLLISION = 1u << 19, // at least one of H2..Hmax was excluded (folded onto another lobe)
     FLAG_SPUR_UNRESOLVED = 1u << 20,  // largest spur is not 12 dB above the noise median
 
     FLAGS_REJECTING      = 0x0000FFFFu
@@ -161,7 +194,7 @@ struct RecordMeta {
 
 struct Options {
     WindowType window;
-    int    maxHarmonic;          // highest harmonic counted (MT-003: 6)
+    int    maxHarmonic;          // highest harmonic counted (MT-003: 6; at most 10)
     size_t minSamples;           // TOO_SHORT below this
     double minCycles;            // FEW_CYCLES below this
     double minAmplitudeCodes;    // LOW_AMPLITUDE below this
@@ -207,6 +240,7 @@ struct HarmonicLine {
     double dbc;           // 10 log10(P_h / S)
     double power;         // code^2
     bool   valid;         // false when its lobe collides with DC, the fundamental or another harmonic
+    bool   resolved;      // lobe power clears the noise median by Options::spurResolvedDb
 };
 
 struct SpectrumResult {
@@ -230,7 +264,7 @@ struct SpectrumResult {
     bool   spurResolved;
     double noiseMedianDbc;// median unmasked bin power relative to S
     double dcPower;       // DC lobe power (after fitted-DC removal), diagnostics
-    HarmonicLine harmonic[8]; // index h = 2..maxHarmonic used; 0,1 unused
+    HarmonicLine harmonic[11]; // index h = 2..maxHarmonic used; 0,1 unused
 };
 
 struct Result {
@@ -276,90 +310,15 @@ inline size_t fftLengthFor(size_t n, size_t cap = 0) {
     return p;
 }
 
-// Doubles the spectrum estimator needs for a record of n samples:
-// nfft doubles for the in-place transform plus nfft/2 + 1 for the bin powers.
-inline size_t workspaceDoubles(size_t n, size_t cap = 0) {
+// SpectrumReal entries the spectrum estimator needs for a record of n
+// samples, laid out as the header comment describes: nfft input, nfft/2 + 1
+// bin powers, nfft transform output, nfft/4 + 1 twiddles.
+inline size_t workspaceReals(size_t n, size_t cap = 0) {
     size_t nfft = fftLengthFor(n, cap);
-    return nfft ? nfft + nfft / 2 + 1 : 0;
+    return nfft ? nfft + nfft / 2 + 1 + nfft + RealFFT<SpectrumReal>::twiddleCount((uint32_t)nfft) : 0;
 }
-
-// ---------------------------------------------------------------------------
-// Double-precision real FFT (radix-2, in place, via a half-length complex FFT)
-// ---------------------------------------------------------------------------
 
 namespace detail {
-
-// In-place iterative radix-2 complex FFT on m interleaved (re, im) pairs.
-// m must be a power of two. Twiddles come from a per-stage rotation
-// recurrence reseeded from cos/sin at every stage, accurate to ~1e-13 for
-// m up to 2^15.
-inline void complexFFT(double* z, size_t m) {
-    // bit-reversal permutation
-    for (size_t i = 1, j = 0; i < m; ++i) {
-        size_t bit = m >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            std::swap(z[2 * i],     z[2 * j]);
-            std::swap(z[2 * i + 1], z[2 * j + 1]);
-        }
-    }
-    for (size_t len = 2; len <= m; len <<= 1) {
-        const double ang = -2.0 * M_PI / (double)len;
-        const double wr = cos(ang), wi = sin(ang);
-        const size_t half = len >> 1;
-        for (size_t i = 0; i < m; i += len) {
-            double cr = 1.0, ci = 0.0;
-            for (size_t j = 0; j < half; ++j) {
-                if ((j & 63) == 0 && j) {           // reseed to bound recurrence drift
-                    cr = cos(ang * (double)j);
-                    ci = sin(ang * (double)j);
-                }
-                double* a = z + 2 * (i + j);
-                double* b = z + 2 * (i + j + half);
-                double tr = b[0] * cr - b[1] * ci;
-                double ti = b[0] * ci + b[1] * cr;
-                b[0] = a[0] - tr;  b[1] = a[1] - ti;
-                a[0] += tr;        a[1] += ti;
-                double ncr = cr * wr - ci * wi;
-                ci = cr * wi + ci * wr;
-                cr = ncr;
-            }
-        }
-    }
-}
-
-// Real FFT of the nfft doubles in `work` (interpreted as nfft/2 complex
-// pairs after packing), writing |X[k]|^2 for k = 0..nfft/2 into `power`.
-inline void realFFTPower(double* work, size_t nfft, double* power) {
-    const size_t m = nfft / 2;
-    complexFFT(work, m);
-    // X[0] and X[nfft/2] from Z[0]
-    double z0r = work[0], z0i = work[1];
-    power[0] = (z0r + z0i) * (z0r + z0i);
-    power[m] = (z0r - z0i) * (z0r - z0i);
-    const double ang = -2.0 * M_PI / (double)nfft;
-    for (size_t k = 1; k <= m / 2; ++k) {
-        size_t j = m - k;
-        double zkr = work[2 * k], zki = work[2 * k + 1];
-        double zjr = work[2 * j], zji = work[2 * j + 1];
-        // even part E = (Zk + conj(Zj)) / 2, odd part O = (Zk - conj(Zj)) / (2i)
-        double er = 0.5 * (zkr + zjr), ei = 0.5 * (zki - zji);
-        double orr = 0.5 * (zki + zji), oi = -0.5 * (zkr - zjr);
-        double c = cos(ang * (double)k), s = sin(ang * (double)k);
-        // X[k] = E + W^k O, W^k = c + i s
-        double tr = orr * c - oi * s, ti = orr * s + oi * c;
-        double xr = er + tr, xi = ei + ti;
-        power[k] = xr * xr + xi * xi;
-        // X[j], j = nfft/2 - k, by the same split with the roles swapped.
-        double er2 = 0.5 * (zjr + zkr), ei2 = 0.5 * (zji - zki);
-        double or2 = 0.5 * (zji + zki), oi2 = -0.5 * (zjr - zkr);
-        double c2 = cos(ang * (double)j), s2 = sin(ang * (double)j);
-        double tr2 = or2 * c2 - oi2 * s2, ti2 = or2 * s2 + oi2 * c2;
-        double xr2 = er2 + tr2, xi2 = ei2 + ti2;
-        power[j] = xr2 * xr2 + xi2 * xi2;
-    }
-}
 
 inline double db10(double ratio) {
     return ratio > 0.0 ? 10.0 * log10(ratio) : -999.0;
@@ -658,12 +617,12 @@ struct BinPowerInfo {
 
 // Windowed bin powers of x[0..n). `dcCodes` is subtracted before windowing
 // (use the fitted DC so the DC lobe cannot swallow a low tone). `work` must
-// hold workspaceDoubles(n) doubles; on return the first nfft/2+1 entries of
+// hold workspaceReals(n) entries; on return the first nfft/2+1 entries of
 // work + nfft hold the bin powers in code^2: a sinusoid's lobe sums to
 // A^2/2, noise bins sum to the noise power in that band. Returns false if
 // the workspace or record is unusable.
 inline bool computeBinPowers(const uint16_t* x, size_t n, const RecordMeta& meta,
-                             const Options& opt, double dcCodes, double* work,
+                             const Options& opt, double dcCodes, SpectrumReal* work,
                              BinPowerInfo& info) {
     memset(&info, 0, sizeof(info));
     const size_t nfft = fftLengthFor(n, opt.maxFftLength);
@@ -672,8 +631,15 @@ inline bool computeBinPowers(const uint16_t* x, size_t n, const RecordMeta& meta
     if (!cosineSeries(opt.window, win)) return false;   // not a cosine-series window
     const double fs = meta.fsHz;
     const size_t half = nfft / 2;
-    double* power = work + nfft;
-    // Window and pack: real samples 2k, 2k+1 become complex pair k.
+    SpectrumReal* input   = work;
+    SpectrumReal* power   = work + nfft;
+    SpectrumReal* output  = power + half + 1;
+    SpectrumReal* twiddle = output + nfft;
+    RealFFT<SpectrumReal> fft;
+    if (!fft.init((uint32_t)nfft, twiddle, RealFFT<SpectrumReal>::twiddleCount((uint32_t)nfft))) return false;
+
+    // Window in double from the cosine series, sample by sample; the sums
+    // stay double, the windowed sample is stored as SpectrumReal.
     double sumW = 0.0, sumW2 = 0.0;
     const double theta = 2.0 * M_PI / (double)nfft;
     const double dr = cos(theta), di = sin(theta);
@@ -682,21 +648,24 @@ inline bool computeBinPowers(const uint16_t* x, size_t n, const RecordMeta& meta
         if ((i & 255) == 0) { cr = cos(theta * (double)i); ci = sin(theta * (double)i); }
         const double wv = windowValue(win, cr);
         sumW += wv; sumW2 += wv * wv;
-        work[i] = wv * ((double)x[i] - dcCodes);
+        input[i] = (SpectrumReal)(wv * ((double)x[i] - dcCodes));
         double ncr = cr * dr - ci * di;
         ci = cr * di + ci * dr;
         cr = ncr;
     }
-    detail::realFFTPower(work, nfft, power);
+    fft.forward(input, output);
 
     // Bin power in code^2: p[k] = d |X[k]|^2 / (nfft sum(w^2)), d = 2 except DC/Nyquist.
     // Summed over a lobe this gives the sinusoid's power A^2/2; summed over
     // noise bins it gives the noise power in that band (Parseval with the
-    // ENBW normalisation built in).
+    // ENBW normalisation built in). The transform packs DC into output[0]
+    // and Nyquist into output[1], then [re, im] pairs for bins 1..nfft/2-1.
     const double norm = 1.0 / ((double)nfft * sumW2);
-    for (size_t k = 0; k <= half; ++k) {
-        const double d = (k == 0 || k == half) ? 1.0 : 2.0;
-        power[k] = d * power[k] * norm;
+    power[0]    = (SpectrumReal)((double)(output[0] * output[0]) * norm);
+    power[half] = (SpectrumReal)((double)(output[1] * output[1]) * norm);
+    for (size_t k = 1; k < half; ++k) {
+        const SpectrumReal re = output[2 * k], im = output[2 * k + 1];
+        power[k] = (SpectrumReal)(2.0 * (double)(re * re + im * im) * norm);
     }
 
     info.nfft = nfft;
@@ -708,15 +677,16 @@ inline bool computeBinPowers(const uint16_t* x, size_t n, const RecordMeta& meta
 }
 
 // MT-003 bookkeeping on a bin-power array: one record's powers from
-// computeBinPowers(), or the mean of several (see SpectrumAverage.h).
-// `power` holds info.nfft/2 + 1 entries in code^2 and is not modified.
-// `scratch` must hold info.nfft doubles (the transform half of the
-// workspace is free once the powers exist). meta.fHintHz steers the
-// fundamental search as in analyzeSpectrum(). Returns false when no
-// fundamental can be found.
-inline bool spectrumMetrics(const double* power, const BinPowerInfo& info,
+// computeBinPowers() (SpectrumReal), or the mean of several (double, see
+// SpectrumAverage.h); P is either. `power` holds info.nfft/2 + 1 entries
+// in code^2 and is not modified; every sum over it is double. `scratch`
+// must hold info.nfft SpectrumReal (the input slice of the workspace is
+// free once the powers exist). meta.fHintHz steers the fundamental search
+// as in analyzeSpectrum(). Returns false when no fundamental can be found.
+template<typename P>
+inline bool spectrumMetrics(const P* power, const BinPowerInfo& info,
                             const RecordMeta& meta, const Options& opt,
-                            double* scratch, SpectrumResult& spec) {
+                            SpectrumReal* scratch, SpectrumResult& spec) {
     memset(&spec, 0, sizeof(spec));
     if (!power || !scratch || info.nfft == 0 || meta.fsHz <= 0.0) return false;
     CosineSeries win;
@@ -769,11 +739,33 @@ inline bool spectrumMetrics(const double* power, const BinPowerInfo& info,
     spec.dcPower = dcP;
     double R = total - S - dcP;
 
+    // Noise median over the unmasked bins, on a compacted copy in the input
+    // slice of the workspace (free once the powers exist), so the bin-power
+    // array stays in order for the caller. A line is "resolved" when it
+    // clears this median by Options::spurResolvedDb.
+    double med = 0.0;
+    {
+        SpectrumReal* tmp = scratch;
+        size_t cnt = 0;
+        for (int k = dcHi + 1; k < (int)half; ++k) {
+            if (k >= fLo && k <= fHi) continue;
+            tmp[cnt++] = (SpectrumReal)power[k];
+        }
+        if (cnt) {
+            std::nth_element(tmp, tmp + cnt / 2, tmp + cnt);
+            med = (double)tmp[cnt / 2];
+        }
+        spec.noiseMedianDbc = detail::db10(med / S);
+    }
+    const double resolvedFactor = pow(10.0, opt.spurResolvedDb / 10.0);
+
     // Harmonics H2..Hmax, folded into 0..fs/2, each a +/-L lobe. A lobe that
-    // touches DC, the fundamental or an earlier harmonic is excluded.
+    // touches DC, the fundamental or an earlier harmonic is excluded. A
+    // harmonic counts toward THD either way; `resolved` tells the reader
+    // whether its lobe stands above the noise (2L + 1 bins of the median).
     const double f1 = spec.fHz;
     double harmonicPower = 0.0;
-    const int hmax = std::min(opt.maxHarmonic, 7);
+    const int hmax = std::min(opt.maxHarmonic, 10);
     for (int h = 2; h <= hmax; ++h) {
         double fh = fmod((double)h * f1 + 0.5 * fs, fs);
         if (fh < 0.0) fh += fs;
@@ -792,6 +784,7 @@ inline bool spectrumMetrics(const double* power, const BinPowerInfo& info,
         for (int k = hLo; k <= hHi; ++k) p += power[k];
         hl.power = p;
         hl.dbc = detail::db10(p / S);
+        hl.resolved = p > med * (double)(2 * L + 1) * resolvedFactor;
         if (hl.valid) harmonicPower += p;
     }
     spec.harmonicPower = harmonicPower;
@@ -814,25 +807,7 @@ inline bool spectrumMetrics(const double* power, const BinPowerInfo& info,
     }
     spec.spurPower = spurP;
     spec.spurDbc = detail::db10(spurP / S);
-
-    // Noise median over the unmasked bins, on a compacted copy in the
-    // transform half of the workspace (free once the powers exist), so the
-    // bin-power array stays in order for the caller.
-    {
-        double* tmp = scratch;             // nfft doubles, transform no longer needed
-        size_t cnt = 0;
-        for (int k = dcHi + 1; k < (int)half; ++k) {
-            if (k >= fLo && k <= fHi) continue;
-            tmp[cnt++] = power[k];
-        }
-        double med = 0.0;
-        if (cnt) {
-            std::nth_element(tmp, tmp + cnt / 2, tmp + cnt);
-            med = tmp[cnt / 2];
-        }
-        spec.noiseMedianDbc = detail::db10(med / S);
-        spec.spurResolved = (spurBin >= 0) && (spurBinP > med * pow(10.0, opt.spurResolvedDb / 10.0));
-    }
+    spec.spurResolved = (spurBin >= 0) && (spurBinP > med * resolvedFactor);
 
     spec.R = R;
     spec.sinadDb = detail::db10(S / R);
@@ -849,7 +824,7 @@ inline bool spectrumMetrics(const double* power, const BinPowerInfo& info,
 // spectrumMetrics(). The bin powers stay at work + nfft on return, which is
 // what the averaging in SpectrumAverage.h reads.
 inline bool analyzeSpectrum(const uint16_t* x, size_t n, const RecordMeta& meta,
-                            const Options& opt, double dcCodes, double* work,
+                            const Options& opt, double dcCodes, SpectrumReal* work,
                             SpectrumResult& spec) {
     memset(&spec, 0, sizeof(spec));
     BinPowerInfo info;
@@ -864,7 +839,7 @@ inline bool analyzeSpectrum(const uint16_t* x, size_t n, const RecordMeta& meta,
 // Analyze one record. `work` may be null (spectrum skipped, fit only; the
 // tone is then found from zero crossings when meta.fHintHz == 0).
 inline Result analyze(const uint16_t* x, size_t n, const RecordMeta& meta,
-                      const Options& opt, double* work) {
+                      const Options& opt, SpectrumReal* work) {
     Result r;
     memset(&r, 0, sizeof(r));
     r.meta = meta;
@@ -935,7 +910,7 @@ inline Result analyze(const uint16_t* x, size_t n, const RecordMeta& meta,
             cosineSeries(opt.window, winL);
             const int L = winL.lobeBins;
             if (r.spec.peakBin - L <= L) r.flags |= FLAG_LOBE_OVERLAP;
-            for (int h = 2; h <= std::min(opt.maxHarmonic, 7); ++h)
+            for (int h = 2; h <= std::min(opt.maxHarmonic, 10); ++h)
                 if (!r.spec.harmonic[h].valid) { r.flags |= FLAG_HARMONIC_COLLISION; break; }
             if (!r.spec.spurResolved) r.flags |= FLAG_SPUR_UNRESOLVED;
             if (fitOk && fabs(r.spec.fHz - r.fit.fHz) > r.spec.binHz) r.flags |= FLAG_HINT_MISMATCH;
@@ -1084,10 +1059,11 @@ inline void reportRecord(const Result& r, const Options& opt, LineSink sink, voi
                  r.spec.sfdrDbc, r.spec.sfdrDbfs, r.spec.spurHz,
                  r.spec.spurResolved ? "" : ", not resolved above the noise median");
         sink(ctx, b);
-        for (int h = 2; h <= std::min(opt.maxHarmonic, 7); ++h) {
+        for (int h = 2; h <= std::min(opt.maxHarmonic, 10); ++h) {
             const HarmonicLine& hl = r.spec.harmonic[h];
-            snprintf(b, sizeof b, "H%d      %.2f dBc at %.1f Hz%s", h, hl.dbc, hl.hz,
-                     hl.valid ? "" : " (excluded: lobe collision)");
+            snprintf(b, sizeof b, "H%d      %.2f dBc at %.1f Hz%s%s", h, hl.dbc, hl.hz,
+                     hl.valid ? "" : " (excluded: lobe collision)",
+                     hl.resolved ? "" : " (below floor)");
             sink(ctx, b);
         }
         CosineSeries winR;

@@ -23,6 +23,9 @@
  * sums is the sum of mean powers, SINAD of the average equals the mean of
  * the single-record SINAD values to within their scatter.
  *
+ * The mean is accumulated in double whatever SpectrumReal the records'
+ * powers arrive in (see SineMetrics.h for the precision contract).
+ *
  * Portable C++11, no allocation: the caller owns the mean buffer.
  *
  *   This file is a part of the SignalCore project, a cross-platform digital
@@ -59,14 +62,15 @@ struct PsdAverage {
         count_ = 0;
     }
 
-    // Fold one record's bin powers (computeBinPowers() output) into the
-    // mean. A record from a different transform length or window restarts
-    // the average. Returns false when no buffer is bound or it is too small.
-    bool add(const double* power, const BinPowerInfo& info) {
+    // Fold one record's bin powers (computeBinPowers() output, SpectrumReal)
+    // into the mean. A record from a different transform length or window
+    // restarts the average. Returns false when no buffer is bound or it is
+    // too small.
+    bool add(const SpectrumReal* power, const BinPowerInfo& info) {
         const size_t bins = info.nfft / 2 + 1;
         if (!mean_ || !power || info.nfft == 0 || bins > capacity_) return false;
         if (count_ == 0 || info.nfft != info_.nfft || info.window != info_.window) {
-            memcpy(mean_, power, bins * sizeof(double));
+            for (size_t k = 0; k < bins; ++k) mean_[k] = (double)power[k];
             info_ = info;
             count_ = 1;
             return true;
@@ -75,7 +79,7 @@ struct PsdAverage {
         // forgetting with the same weight.
         const unsigned n = count_ < depth_ ? count_ + 1 : depth_;
         const double w = 1.0 / (double)n;
-        for (size_t k = 0; k < bins; ++k) mean_[k] += w * (power[k] - mean_[k]);
+        for (size_t k = 0; k < bins; ++k) mean_[k] += w * ((double)power[k] - mean_[k]);
         if (count_ < depth_) ++count_;
         return true;
     }
@@ -110,12 +114,12 @@ struct AveragedResult {
     double   enobFullScale;  // (SINAD - 1.76 + 20 log10(F / A)) / 6.02
 };
 
-// Metrics of the current mean. `scratch` must hold nfft doubles; meta
-// supplies the sample rate, resolution and the tone hint (use the last
-// record's fitted frequency). Returns false when the average is empty or
-// no fundamental is found.
+// Metrics of the current mean. `scratch` must hold nfft SpectrumReal (the
+// workspace's input slice serves); meta supplies the sample rate,
+// resolution and the tone hint (use the last record's fitted frequency).
+// Returns false when the average is empty or no fundamental is found.
 inline bool analyzeAverage(const PsdAverage& avg, const RecordMeta& meta,
-                           const Options& opt, double* scratch, AveragedResult& out) {
+                           const Options& opt, SpectrumReal* scratch, AveragedResult& out) {
     memset(&out, 0, sizeof(out));
     if (!avg.valid()) return false;
     if (!spectrumMetrics(avg.powers(), avg.info(), meta, opt, scratch, out.spec)) return false;
