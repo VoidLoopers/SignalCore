@@ -342,14 +342,16 @@ the size you need rather than resizing in the loop.
 ### Measuring a converter: SINAD, ENOB, SFDR
 
 `measure/SineMetrics.h` (namespace `signalcore::measure`) turns one record
-of raw ADC codes containing a sine wave into the MT-003 figures of merit,
-with the math done in double on the board:
+of raw ADC codes containing a sine wave into the MT-003 figures of merit.
+The transform is `RealFFT<SpectrumReal>` (float unless the build defines
+`SIGNALCORE_SINEMETRICS_DOUBLE_FFT` to 1); every sum, the spectrum average
+and the sine fit are double:
 
 ```cpp
 using namespace signalcore::measure;
 RecordMeta meta = {797872.34, 12, 805.9, 1000.0};   // fs, bits, uV/LSB, tone hint (0 = find)
-Options opt;                                        // Blackman-Harris 4-term, H2..H6
-static double work[8192 + 4097];                    // workspaceDoubles(8192)
+Options opt;                                        // Blackman-Harris 4-term, H2..H6 (up to H10)
+static SpectrumReal work[22530];                    // workspaceReals(8192): 2.75 x nfft + 2
 Result r = analyze(codes, 8192, meta, opt, work);
 if (r.valid) Serial.printf("SINAD %.2f dB  ENOB %.2f (FS)  SFDR %.1f dBc\n",
                            r.sinadDb, r.enobFullScale, r.spec.sfdrDbc);
