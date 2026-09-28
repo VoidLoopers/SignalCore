@@ -1050,16 +1050,17 @@ inline void reportRecord(const Result& r, const Options& opt, LineSink sink, voi
              r.enobAtInput, r.enobFullScale);
     sink(ctx, b);
     if (r.specValid) {
-        snprintf(b, sizeof b, "SNR     %.2f dB   (H2..H%d removed)", r.spec.snrDb, opt.maxHarmonic);
+        const int hmax = std::min(opt.maxHarmonic, 10);
+        snprintf(b, sizeof b, "SNR     %.2f dB   (H2..H%d removed)", r.spec.snrDb, hmax);
         sink(ctx, b);
         snprintf(b, sizeof b, "THD     %.2f dBc  (H2..H%d rss over the fundamental, negative = below carrier)",
-                 r.spec.thdDbc, opt.maxHarmonic);
+                 r.spec.thdDbc, hmax);
         sink(ctx, b);
         snprintf(b, sizeof b, "SFDR    %.2f dBc, %.2f dBFS  (largest line at %.1f Hz%s)",
                  r.spec.sfdrDbc, r.spec.sfdrDbfs, r.spec.spurHz,
                  r.spec.spurResolved ? "" : ", not resolved above the noise median");
         sink(ctx, b);
-        for (int h = 2; h <= std::min(opt.maxHarmonic, 10); ++h) {
+        for (int h = 2; h <= hmax; ++h) {
             const HarmonicLine& hl = r.spec.harmonic[h];
             snprintf(b, sizeof b, "H%d      %.2f dBc at %.1f Hz%s%s", h, hl.dbc, hl.hz,
                      hl.valid ? "" : " (excluded: lobe collision)",
