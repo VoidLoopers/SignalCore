@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/platformio/platformio-core/develop/platformio/assets/schema/library.json",
   "name": "SignalCore",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Cross-platform digital signal processing toolkit for Arduino: FFT, DDS signal generation, window functions, edge trigger, peak-hold, and exponential moving average. CMSIS-DSP accelerated on Teensy 4.x with a portable C++ fallback elsewhere.",
   "keywords": [
     "arduino",

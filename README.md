@@ -155,9 +155,9 @@ A few things worth knowing:
   `FFT<FFTSize::N1024>`, still works if you prefer it. All three name the same
   type.
 - **The size is fixed at compile time and must be a power of two** from 32 up to
-  `SIGNALCORE_MAX_FFT_SIZE` (32768 on Teensy and most boards; see the board
-  limits below and the configuration table). A value that is not a power of two,
-  such as `FFT<500>`, fails to compile with a message saying why, rather than
+  `SIGNALCORE_MAX_FFT_SIZE` (32768 on most boards, lower on AVR and ESP8266;
+  see the configuration table). A value that is not a power of two, such as
+  `FFT<500>`, fails to compile with a message saying why, rather than
   misbehaving at run time.
 - **Reading the spectrum.** `peakBin()` and `peakFrequency()` hand back the
   dominant tone directly. To read the spectrum itself, treat the FFT object as a
@@ -235,12 +235,11 @@ fft.setWindowType(WindowType::BlackmanHarris);
 
 ### Changing the FFT size at run time
 
-`FFT<N>` fixes its length when the sketch compiles. When the length itself is a
-run-time choice — a spectrum analyzer with a resolution control, or a sketch
-that adapts resolution to the frame rate — use `DynamicFFT` instead. It runs
-the identical transform with the identical output packing and scaling; the only
-differences are that its buffers live on the heap and its size is set with
-`init()`:
+`FFT<N>` fixes its length when the sketch compiles. When the length is a
+run-time choice, such as a spectrum analyzer with a resolution control, use
+`DynamicFFT` instead. Its output matches `FFT<N>` bin for bin, with the same
+packing and scaling. The differences are that its buffers live on the heap and
+you set its size with `init()`:
 
 ```cpp
 DynamicFFT fft;
@@ -251,22 +250,23 @@ void setup() {
 }
 
 void changeResolution(int newSize) {
-    fft.init(newSize);                              // reallocates live, frame to frame
+    fft.init(newSize);                              // frees and reallocates the buffers
     fft.setWindowType(WindowType::BlackmanHarris);  // window length depends on FFT length
 }
 ```
 
-`init()` returns `false` and leaves the object inert if the size is not a power
-of two or the heap allocation fails — before a successful `init()` every
-processing call is a safe no-op. There is no size cap: 8192, 16384 and 32768
-points work wherever the memory does (see the footprint table below). Because
-each `init()` reallocates, prefer `FFT<N>` when the length never changes, and on
+`init()` returns `false` if the size is not a power of two or the heap
+allocation fails. Until an `init()` succeeds, every processing call on the
+object does nothing. There is no size cap: 8192, 16384 and 32768 points work
+wherever the memory does (see the footprint table below). Because each
+`init()` reallocates, prefer `FFT<N>` when the length never changes, and on
 RAM-tight boards mind heap fragmentation just as with the streaming processors.
-`postScaleDB()` on `DynamicFFT` also accepts a third `ceiling` argument for
-boards whose ADC full scale sits above the display reference (for example
-+10.37 dBV for a 3.3 Vpp ADC against a 1.0 Vpp reference).
 
-### The transform engine: `RealFFT<T>`
+Unlike `FFT<N>`, `DynamicFFT`'s `postScaleDB()` takes an optional third
+argument, `ceiling`, for boards whose ADC full scale is above the dB reference
+level (for example +10.37 dBV for a 3.3 Vpp ADC against a 1.0 Vpp reference).
+
+### The core transform: `RealFFT<T>`
 
 `FFT<N>` and `DynamicFFT` both run on `signalcore::RealFFT<float>`
 (`signalcore/fft/RealFFT.h`), and a sketch that wants the raw complex bins
@@ -280,18 +280,19 @@ fft.forward(samples, bins);          // samples are undefined afterwards
 float p = bins[2 * k] * bins[2 * k] + bins[2 * k + 1] * bins[2 * k + 1];
 ```
 
-The engine is chosen per instance from the size: on Teensy 4.x (or another
+The backend is chosen per instance from the size: on Teensy 4.x (or another
 ARM core with `SIGNALCORE_FORCE_CMSIS`) a `float` transform of 32 to 4096
-points runs CMSIS-DSP `arm_rfft_fast_f32`; every other case — `double`, sizes
-above 4096, and every non-CMSIS board — runs the generic radix-2 engine with
-twiddles from a quarter-wave table computed in double. Both give the same
-packing, and `backend()` reports which one ran. `init(n, table, count)` binds
-caller-owned table storage for code that must not allocate.
+points runs CMSIS-DSP `arm_rfft_fast_f32`. Everything else runs the generic
+radix-2 backend: `double` transforms, sizes above 4096, and every non-CMSIS
+board. Its twiddles come from a quarter-wave table computed in double. Both
+give the same packing, and `backend()` reports which one ran. For code that
+must not allocate, `init(n, table, count)` uses a twiddle table you supply
+(`count` at least n/4 + 1).
 
 Precision: the transform runs entirely in `T`. A float transform with table
-twiddles has a round-off floor near -150 dBFS per bin at 8192 points, far below
-any converter up to about 18 effective bits; `RealFFT<double>` exists for the
-20-bit class. Sums over bins belong in `double` either way.
+twiddles has a round-off floor near -150 dBFS per bin at 8192 points, well
+below any converter up to about 16 effective bits; `RealFFT<double>` exists for
+the 20-bit class. Sums over bins belong in `double` either way.
 
 ### Signal generation
 
@@ -344,10 +345,11 @@ the size you need rather than resizing in the loop.
 ### Measuring a converter: SINAD, ENOB, SFDR
 
 `measure/SineMetrics.h` (namespace `signalcore::measure`) turns one record
-of raw ADC codes containing a sine wave into the MT-003 figures of merit.
-The transform is `RealFFT<SpectrumReal>` (float unless the build defines
-`SIGNALCORE_SINEMETRICS_DOUBLE_FFT` to 1); every sum, the spectrum average
-and the sine fit are double:
+of raw ADC codes containing a sine wave into the figures of merit defined in
+Analog Devices tutorial MT-003 (SINAD, ENOB, SFDR, THD). The FFT runs in
+`SpectrumReal`, which is `float` unless the build defines
+`SIGNALCORE_SINEMETRICS_DOUBLE_FFT` to 1. Every sum, the spectrum average and
+the sine fit use `double`:
 
 ```cpp
 using namespace signalcore::measure;
@@ -359,16 +361,17 @@ if (r.valid) Serial.printf("SINAD %.2f dB  ENOB %.2f (FS)  SFDR %.1f dBc\n",
                            r.sinadDb, r.enobFullScale, r.spec.sfdrDbc);
 ```
 
-Two estimators run on the same record: a windowed FFT (Hann, Blackman-Harris
-4-term, Nuttall 4-term, or Blackman-Harris 7-term) with the coherent-gain and
-noise-bandwidth corrections applied and the DC and fundamental lobes excluded,
-and a three-parameter least-squares sine fit that needs no window at all.
-Agreement between the two SINAD values is the built-in check of the window
-corrections, and `r.flags` says why a record was rejected (clipping, too
-short, dropped samples, a wrong hint) instead of returning a wrong number.
-`Aggregate` folds K records into mean/min/max, and `reportRecord()` prints
-the full table. `test/host/test_sine_metrics.cpp` is the synthetic
-validation matrix.
+Two estimators run on the same record. The first is a windowed FFT (Hann,
+Blackman-Harris 4-term, Nuttall 4-term, or Blackman-Harris 7-term) with
+coherent-gain and noise-bandwidth corrections applied and the DC and
+fundamental lobes excluded. The second is a three-parameter least-squares sine
+fit, which needs no window. If the two SINAD values agree, the window
+corrections are right; that comparison is the built-in check. `r.flags` says
+why a record was rejected (clipping, too short, dropped samples, a wrong hint)
+instead of returning a wrong number. `Aggregate` folds K records into
+mean/min/max, and `reportRecord()` prints the full table. The validation
+tests, which run on synthetic records, are in
+`test/host/test_sine_metrics.cpp`.
 
 ## Configuration and platforms
 
@@ -397,7 +400,7 @@ that behavior. Set them **before** `#include <SignalCore.h>`.
 The generic backend produces the same output as the CMSIS backend, bin for bin
 (it matches the `arm_rfft_fast_f32` packing), so spectrum-analysis sketches behave
 the same across all of these boards. CMSIS-DSP covers 32 to 4096 points; a
-transform above that runs the generic engine on every platform.
+transform above that runs the generic backend on every platform.
 
 ### Memory footprint
 
@@ -421,6 +424,7 @@ floats) and the twiddle table (N/4 + 1 floats):
 the heap on each `init()` instead of reserving them statically. A bare
 `RealFFT<T>` holds only the twiddle table; its input and output buffers are the
 caller's.
+
 `PeakHoldProcessor` and `ExponentialMovingAverage` size their buffers when
 constructed, and they take that memory from the heap rather than reserving it
 statically. On a RAM-tight board such as an AVR, create them once at the size you
