@@ -14,8 +14,8 @@
  *   SFDR    signal over the largest spur, in dBc and dBFS
  *
  * Hmax is Options::maxHarmonic: 6 by default (MT-003), up to 10. Every
- * harmonic counts toward THD whether or not it stands above the noise
- * (IEEE 1241 practice); HarmonicLine::resolved says which ones do.
+ * non-colliding harmonic counts toward THD even below the noise floor.
+ * HarmonicLine::resolved indicates whether its power clears the noise threshold.
  *
  * Two independent estimators run on the same record:
  *
@@ -27,54 +27,31 @@
  *   2. A three-parameter least-squares sine fit in the time domain
  *      (x[n] = c + a cos(wn) + b sin(wn)). It needs no window and no FFT
  *      gain correction, so agreement between the two SINAD values on the
- *      same record is the built-in check of the window corrections.
+ *      same record provides a consistency check between the estimators.
  *
  * The record is never modified and no memory is allocated here. The FFT
  * path needs a caller-supplied workspace (see workspaceReals()); the fit
- * needs about 1 kB of stack.
+ * uses local working variables.
  *
- * Precision: the transform is signalcore::RealFFT<SpectrumReal>, the shared
- * engine every SignalCore class uses. SpectrumReal is float unless the
- * build defines SIGNALCORE_SINEMETRICS_DOUBLE_FFT to 1. The windowed
- * samples, the transform and the per-bin powers are SpectrumReal; every
- * accumulation (window sums, lobe and noise sums, medians' inputs aside,
- * the spectrum average, the sine fit) is double. A float transform with
- * table twiddles has a round-off floor near -150 dBFS per bin, far below
- * any converter up to about 18 effective bits; the double build exists for
- * the 20-bit class.
+ * SpectrumReal is float by default; define SIGNALCORE_SINEMETRICS_DOUBLE_FFT
+ * to 1 for double-precision samples, transforms and bin powers. Window sums,
+ * power sums and sine fitting use double in either build.
  *
  * Workspace layout, in SpectrumReal, for a transform of nfft points:
  *   [0, nfft)                       windowed input, then free scratch
  *   [nfft, nfft + nfft/2 + 1)       bin powers in code^2 (kept for the caller)
  *   [.., + nfft)                    transform output (CMSIS packing)
  *   [.., + nfft/4 + 1)              twiddle table
- * About 2.75 nfft entries: 11 bytes per sample at float against the 12 of
- * the earlier all-double workspace, and 22 at double.
+ * The workspace uses 2.75 nfft + 2 entries. No heap allocation is required.
  *
- * Portable C++11: no Arduino, no VoidLoopEngine dependency. The same header
- * runs on the host test rig and on the target; on a CMSIS platform a float
- * transform of 32..4096 points runs CMSIS-DSP, every other case the generic
- * engine.
+ * Samples must form one uninterrupted capture at a constant sample rate.
+ * Residual spikes, residual growth and estimator disagreement can indicate
+ * capture errors; these checks do not guarantee capture integrity.
  *
- * Record contract: one contiguous capture at a single sample rate. Records
- * assembled from several DMA fills, or with dropped samples, produce a
- * DISCONTINUITY / RESIDUAL_GROWTH rejection rather than a wrong number.
- * A single wrong sample (an impulse rather than a shift) is caught by the
- * spike screen when it is large, and otherwise by the fit/FFT agreement
- * check: a window weights an impulse by its position, so a non-stationary
- * residual makes the two estimators disagree while a stationary one does
- * not. The spike floor (15 % of the amplitude, the host reference tool's
- * rule) is deliberately loose: real converters throw occasional sparkle
- * codes of a few tens of codes that are part of the measurement, not a
- * capture fault, so they are reported through FitResult::residMaxCodes
- * rather than rejected (a 2 % floor rejected half the Basecamp records on
- * the bench, 2026-09-14, with no change in SINAD).
- *
- * Known limits: a spur that falls inside a harmonic's lobe is counted as
- * that harmonic (THD up, SNR up, SINAD unchanged); Hann's leakage caps the
- * SINAD it can resolve near 40 dB for a tone that is not bin-centred, which
- * the agreement check reports as ESTIMATORS_DISAGREE. Use bh4 or bh7 for
- * converter-class dynamic range.
+ * A lobe is the group of bins around a spectral peak. A spur inside a
+ * harmonic's lobe contributes to that harmonic's power. Window leakage
+ * also contributes to the measured noise and distortion; Blackman-Harris
+ * windows suppress leakage more strongly than Hann.
  *
  *   This file is a part of the SignalCore project, a cross-platform digital
  *   signal processing toolkit released by VoidLoop. See www.voidloop.com for
@@ -103,14 +80,8 @@ namespace measure {
 // Windows
 // ---------------------------------------------------------------------------
 //
-// The window shapes (coefficients, lobe widths) live in signalcore::Windows.h
-// as the single source of truth; this header only adds the serial-protocol
-// name strings ("hann", "bh4", "nuttall4", "bh7") and the wiring to run
-// Windows.h's cosine-series tables through the periodic-form FFT below.
-// "nuttall4" is a protocol-level name for the WindowType::BlackmanNuttall
-// coefficients, not WindowType::Nuttall (Windows.h keeps those as two
-// distinct, differently-tapered windows; the wire format only ever asked
-// for the Blackman-Nuttall one, so the old name stays).
+// Measurement windows use the periodic cosine-series form. The token
+// "nuttall4" selects BlackmanNuttall, which differs from WindowType::Nuttall.
 using signalcore::WindowType;
 using signalcore::CosineSeries;
 using signalcore::cosineSeries;
@@ -124,10 +95,7 @@ typedef double SpectrumReal;
 typedef float SpectrumReal;
 #endif
 
-// Short lower-case token used on the wire (MEAS? requests, sine_metrics_cli,
-// utilities/compare_sine_metrics.py and utilities/adc_measure.py all match
-// on these exact strings). Any other WindowType falls back to its
-// Windows.h abbreviation.
+// Short window name for text output. Other windows use their abbreviation.
 inline const char* windowName(WindowType w) {
     switch (w) {
         case WindowType::Hann:            return "hann";
@@ -138,7 +106,7 @@ inline const char* windowName(WindowType w) {
     }
 }
 
-// Parse one of the four wire tokens above into a WindowType. Returns false
+// Parse one of the four short names above into a WindowType. Returns false
 // (leaving `out` untouched) for anything else.
 inline bool parseWindowName(const char* tok, WindowType& out) {
     if (!strcmp(tok, "hann"))     { out = WindowType::Hann;            return true; }
@@ -148,12 +116,8 @@ inline bool parseWindowName(const char* tok, WindowType& out) {
     return false;
 }
 
-// Window value at sample n of N (periodic form, denominator N):
-//   w[n] = a0 - a1 cos(2pi n/N) + a2 cos(4pi n/N) - ...
-// See signalcore::cosineSeriesValue for the recurrence; this measurement
-// path always uses the periodic form (matches utilities/adc_measure.py,
-// the compare gate is bit-exact), never the symmetric form Windows.h's
-// float display path (createWindowCoefficients) uses.
+// Evaluate w[n] = a0 - a1 cos(theta) + a2 cos(2 theta) - ... .
+// The caller supplies cos(theta), with theta = 2 pi n/N for a periodic window.
 inline double windowValue(const CosineSeries& w, double cosTheta) {
     return cosineSeriesValue(w, cosTheta);
 }
@@ -167,8 +131,8 @@ enum ResultFlag : uint32_t {
     FLAG_CLIPPED         = 1u << 0,   // codes touched a rail (within clipMarginCodes)
     FLAG_TOO_SHORT       = 1u << 1,   // fewer than Options::minSamples
     FLAG_FEW_CYCLES      = 1u << 2,   // fewer than Options::minCycles in the record
-    FLAG_NOT_CONVERGED   = 1u << 3,   // frequency refinement hit its cap or left the bracket
-    FLAG_DISCONTINUITY   = 1u << 4,   // residual spike: dropped or duplicated samples
+    FLAG_NOT_CONVERGED   = 1u << 3,   // fit failed, hit its iteration cap, or reached a search boundary
+    FLAG_DISCONTINUITY   = 1u << 4,   // residual spike exceeds the configured threshold
     FLAG_RESIDUAL_GROWTH = 1u << 5,   // residual rms grows along the record
     FLAG_LOW_AMPLITUDE   = 1u << 6,   // fitted amplitude below Options::minAmplitudeCodes
     FLAG_BAD_ARGS        = 1u << 7,   // null record, fs <= 0, bits out of range
@@ -177,17 +141,17 @@ enum ResultFlag : uint32_t {
 
     // Informational (do not reject)
     FLAG_NO_SPECTRUM     = 1u << 16,  // FFT skipped: no workspace supplied
-    FLAG_SPECTRUM_TRUNCATED = 1u << 17, // n not a power of two; FFT used the first 2^k samples
+    FLAG_SPECTRUM_TRUNCATED = 1u << 17, // FFT used a shorter prefix due to record length or maxFftLength
     FLAG_LOBE_OVERLAP    = 1u << 18,  // fundamental lobe overlaps the DC lobe
     FLAG_HARMONIC_COLLISION = 1u << 19, // at least one of H2..Hmax was excluded (folded onto another lobe)
-    FLAG_SPUR_UNRESOLVED = 1u << 20,  // largest spur is not 12 dB above the noise median
+    FLAG_SPUR_UNRESOLVED = 1u << 20,  // peak spur bin does not clear Options::spurResolvedDb above the median
 
     FLAGS_REJECTING      = 0x0000FFFFu
 };
 
 struct RecordMeta {
-    double  fsHz;         // sample rate, exact (derive from the integer divider)
-    uint8_t bits;         // converter resolution; full scale peak F = 2^(bits-1) codes
+    double  fsHz;         // actual sample rate in Hz
+    uint8_t bits;         // unsigned converter resolution, 2..16 bits; peak F = 2^(bits-1)
     double  scaleUvPerLsb;// microvolts per code, input-referred (0 if unknown)
     double  fHintHz;      // expected tone frequency, 0 = find it from the record
 };
@@ -228,7 +192,7 @@ struct FitResult {
     double sinadDb;       // 10 log10(S / R)
     double spanSinadDb;   // the same over the first spanN samples only (the transform's span)
     double residRmsCodes;
-    double residMaxCodes; // largest |e| over the record
+    double residMaxCodes; // largest first-quarter-model residual; 0 if that model is unavailable
     double headRmsCodes;  // residual rms over the first quarter (head-quarter fit)
     double tailRmsCodes;  // residual rms over the last quarter (same head-quarter parameters)
     int    iterations;
@@ -240,7 +204,7 @@ struct HarmonicLine {
     double dbc;           // 10 log10(P_h / S)
     double power;         // code^2
     bool   valid;         // false when its lobe collides with DC, the fundamental or another harmonic
-    bool   resolved;      // lobe power clears the noise median by Options::spurResolvedDb
+    bool   resolved;      // lobe power clears median bin power times nominal lobe width by spurResolvedDb
 };
 
 struct SpectrumResult {
@@ -280,7 +244,8 @@ struct Result {
     SpectrumResult spec;
     bool           specValid;    // spectrum ran
 
-    // Headline numbers. primaryIsSpectrum says which estimator they come from.
+    // primaryIsSpectrum selects the SINAD source; frequency and amplitude
+    // prefer the fit when its parameters can be solved.
     bool   primaryIsSpectrum;
     double fHz;
     double ampCodes;
@@ -289,9 +254,9 @@ struct Result {
     double sinadDb;
     double enobAtInput;          // (SINAD - 1.76) / 6.02
     double enobFullScale;        // (SINAD - 1.76 + 20 log10(F / A)) / 6.02
-    double fitFftDisagreeDb;     // |fit SINAD - FFT SINAD|
+    double fitFftDisagreeDb;     // |fit spanSinadDb - FFT SINAD| over the same sample span
 
-    // Textbook references for the tutorial (MT-003 and the FFT process gain)
+    // Ideal quantization-noise references and FFT process gain.
     double idealSnrDb;           // 6.02 bits + 1.76
     double processGainDb;        // 10 log10(nfft / 2)
     double idealFftFloorDb;      // idealSnrDb + processGainDb, below full scale
@@ -337,6 +302,7 @@ struct FitSums {
     size_t n;
 };
 
+// Accumulate the sums needed to fit offset, cosine and sine coefficients.
 // One pass over x[0..n) at angular frequency w (rad/sample). cos/sin by a
 // rotation recurrence reseeded every 256 samples. `offset` is subtracted
 // from every code before accumulating to keep the sums well conditioned.
@@ -387,7 +353,7 @@ inline bool solve(const FitSums& s, double& a, double& b, double& c) {
     return true;
 }
 
-// Residual sum of squares at the least-squares solution, from the sums alone:
+// A residual is the sample minus the fitted sine. Its sum of squares is:
 // SS = sum(x^2) - (a*sxc + b*sxs + c*sx).
 inline double residualSS(const uint16_t* x, size_t n, double w, double offset) {
     FitSums s;
@@ -478,11 +444,8 @@ inline double brentMinimize(const uint16_t* x, size_t n, double fs, double offse
 
 } // namespace detail
 
-// The agreement bound for a transform of nfft points. A windowed noise
-// estimate scatters as 1/sqrt(nfft), so the bound that suits 8192 points
-// rejects good records from a shorter transform (white noise alone: 6 % of
-// records at 2048 points against 0.5 dB). Options::agreeToleranceDb is the
-// bound at 8192 points and above; below that it widens by sqrt(8192/nfft).
+// Shorter records have more variation in estimated noise power. Below 8192
+// samples, widen the fit/FFT tolerance by sqrt(8192/nfft).
 inline double agreeToleranceFor(const Options& opt, size_t nfft) {
     if (nfft == 0 || nfft >= 8192) return opt.agreeToleranceDb;
     return opt.agreeToleranceDb * sqrt(8192.0 / (double)nfft);
@@ -516,7 +479,7 @@ inline bool fitSine(const uint16_t* x, size_t n, double fs, double seedHz,
     double fBest = detail::brentMinimize(x, n, fs, offset, lo, hi, seedHz, tolHz,
                                          maxIterations, iters, conv);
 
-    // Final exact pass at fBest: parameters over the full record, then the
+    // Solve at fBest over the full record, then evaluate the
     // residual sample by sample (also feeds the integrity screens).
     const double w = 2.0 * M_PI * fBest / fs;
     detail::FitSums s;
@@ -525,11 +488,9 @@ inline bool fitSine(const uint16_t* x, size_t n, double fs, double seedHz,
     if (!detail::solve(s, a, b, c)) return false;
 
     // Head-quarter parameters for the discontinuity screen: refine the
-    // frequency AND the amplitude/phase/offset on the first quarter alone,
-    // then evaluate that model over the whole record. A dropped or
-    // duplicated sample later in the record shows up as a growing phase
-    // error against the uncontaminated head model. (Refining f on the whole
-    // record first lets it absorb half of such a step, which hides it.)
+    // frequency, amplitude, phase and offset on the first quarter alone.
+    // Evaluating that model over the whole record helps expose later phase
+    // shifts that a full-record fit could partly absorb.
     const size_t q = n / 4;
     double wh = w;
     double ah = 0.0, bh = 0.0, ch = 0.0;
@@ -617,7 +578,7 @@ struct BinPowerInfo {
 
 // Windowed bin powers of x[0..n). `dcCodes` is subtracted before windowing
 // (use the fitted DC so the DC lobe cannot swallow a low tone). `work` must
-// hold workspaceReals(n) entries; on return the first nfft/2+1 entries of
+// hold workspaceReals(n, opt.maxFftLength) entries; on return the first nfft/2+1 entries of
 // work + nfft hold the bin powers in code^2: a sinusoid's lobe sums to
 // A^2/2, noise bins sum to the noise power in that band. Returns false if
 // the workspace or record is unusable.
@@ -699,10 +660,9 @@ inline bool spectrumMetrics(const P* power, const BinPowerInfo& info,
     spec.enbwBins = info.enbwBins;
     const int L = win.lobeBins;
 
-    // Fundamental: nearest the hint, else the largest bin above DC. The
-    // search includes the DC lobe: the caller has removed the offset, and a
-    // tone only a few bins up (1 kHz in a 2048-point transform at 800 kSPS
-    // is bin 2.6) would otherwise lose to the largest spur.
+    // Select the strongest bin within +/-L bins of the hint, or search all
+    // interior bins if no hint region is available. Include bins near DC so
+    // low-frequency tones remain detectable after offset removal.
     int peak = -1;
     if (meta.fHintHz > 0.0) {
         int kh = (int)floor(meta.fHintHz / spec.binHz + 0.5);
@@ -741,8 +701,9 @@ inline bool spectrumMetrics(const P* power, const BinPowerInfo& info,
 
     // Noise median over the unmasked bins, on a compacted copy in the input
     // slice of the workspace (free once the powers exist), so the bin-power
-    // array stays in order for the caller. A line is "resolved" when it
-    // clears this median by Options::spurResolvedDb.
+    // array stays in order for the caller. A spur is "resolved" when its
+    // peak bin clears this median by Options::spurResolvedDb; harmonics
+    // compare integrated lobe power with the corresponding noise estimate.
     double med = 0.0;
     {
         SpectrumReal* tmp = scratch;
@@ -761,8 +722,9 @@ inline bool spectrumMetrics(const P* power, const BinPowerInfo& info,
 
     // Harmonics H2..Hmax, folded into 0..fs/2, each a +/-L lobe. A lobe that
     // touches DC, the fundamental or an earlier harmonic is excluded. A
-    // harmonic counts toward THD either way; `resolved` tells the reader
-    // whether its lobe stands above the noise (2L + 1 bins of the median).
+    // valid harmonic contributes to THD whether resolved or not. Resolution
+    // requires its power to exceed median bin power times (2L + 1) by
+    // the configured dB margin.
     const double f1 = spec.fHz;
     double harmonicPower = 0.0;
     const int hmax = std::min(opt.maxHarmonic, 10);
@@ -920,9 +882,9 @@ inline Result analyze(const uint16_t* x, size_t n, const RecordMeta& meta,
     }
 
     // Headline numbers.
-    // The fit's frequency and amplitude are the better estimates whenever
-    // the fit converged (1e-6 bin resolution, no window bias); the spectrum
-    // supplies SINAD and everything that needs a spectrum.
+    // Use fitted frequency and amplitude when the parameter solve succeeds.
+    // The spectrum supplies SINAD when available; rejection flags still
+    // determine whether the record is valid.
     r.primaryIsSpectrum = r.specValid;
     if (r.specValid) {
         r.fHz = fitOk ? r.fit.fHz : r.spec.fHz;
@@ -1011,7 +973,7 @@ inline size_t formatFlags(uint32_t flags, char* out, size_t cap) {
     return len;
 }
 
-// One-line record summary, key=value, for serial logs and host diffs.
+// One-line record summary in key=value form.
 inline int formatRecordLine(const Result& r, unsigned index, char* out, size_t cap) {
     char fl[96];
     formatFlags(r.flags, fl, sizeof(fl));
@@ -1030,8 +992,7 @@ inline int formatRecordLine(const Result& r, unsigned index, char* out, size_t c
 // Sink for the multi-line report: called once per line, without newline.
 typedef void (*LineSink)(void* ctx, const char* line);
 
-// MT-003 table for one record: every number names its definition, band and
-// amplitude convention, per the tutorial rule.
+// Report one record with metric definitions, units and frequency band.
 inline void reportRecord(const Result& r, const Options& opt, LineSink sink, void* ctx) {
     char b[160];
     char fl[96];

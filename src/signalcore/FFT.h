@@ -76,11 +76,10 @@ namespace signalcore {
 // argument and an array declaration from a single source of truth.
 //
 // The names stop at 32768: that is the default SIGNALCORE_MAX_FFT_SIZE off
-// AVR and ESP8266, and the largest value the uint16_t base holds. On a board
+// AVR and ESP8266, and the largest power of two uint16_t holds. On a board
 // with a lower cap the larger names still exist but fail the FFT<N>
 // static_assert. Sizes above 4096 run the generic engine on every platform
-// (CMSIS-DSP covers 32..4096), so expect the step in transform time there:
-// on a Teensy 4.1 about 0.3 ms at 4096 and 1.6 ms at 8192.
+// (CMSIS-DSP covers 32..4096).
 enum FFTSize : uint16_t {
     N32    = 32,
     N64    = 64,
@@ -190,8 +189,9 @@ inline float signalToNoiseRatioDB(float signalAmplitude, float noiseAmplitude) {
 // returns nonsense silently). Walks outward from the peak bin, counting
 // bins as "signal" while they stay at or above twice the spectrum mean
 // (the test (data[bin] - avg) >= avg is data[bin] >= 2*avg); the remaining
-// bins in each direction count as noise+distortion power. Bin 0 (DC) is
-// excluded from both sums.
+// bins in each direction count as noise+distortion power. Remove DC first:
+// bin 0 participates if it is the largest bin. This is a threshold-based
+// estimate, so its signal/noise boundary depends on the spectrum.
 inline float SINAD(float* data, int size) {
     double avg = mean(data, size);
     int peakBin = findPeak(data, size);
@@ -228,22 +228,19 @@ inline float ENOB(float* data, int size) {
 
 // FFT_LENGTH is a plain integer (e.g. 512 or FFTSize::N512 — the unscoped enum
 // value converts). The same symbol can therefore size the sample arrays in a
-// sketch, so callers no longer track the length and the template argument
-// separately.
+// sketch, so one value sizes both the transform and its input arrays.
 //
 // Memory: each instance embeds samples_[N] + result_[N] + windowCoef_[N/2]
-// + twiddle_[N/4 + 1] = 2.75 * N floats (11 * N bytes): FFT<1024> ~ 11 KB,
-// FFT<4096> ~ 44 KB. Declare instances at global/static scope — a
-// function-local FFT of any real size will overflow the stack on embedded
-// targets.
+// + twiddle_[N/4 + 1], approximately 2.75 * N floats (11 * N bytes): FFT<1024> ~ 11 KB,
+// FFT<4096> ~ 44 KB. Prefer global/static storage for large instances to
+// avoid exhausting an embedded target's stack.
 template<size_t FFT_LENGTH>
 class FFT {
 private:
     static constexpr int N = static_cast<int>(FFT_LENGTH);
 
-    // The transform is radix-2, so the length must be a power of two. The enum
-    // used to guarantee this; with a free integer parameter we check it here so
-    // FFT<500> fails loudly at compile time instead of producing garbage.
+    // The transform is radix-2, so the length must be a power of two. Enum
+    // values and plain integer arguments must satisfy the same constraint.
     static_assert(FFT_LENGTH >= 32 && (FFT_LENGTH & (FFT_LENGTH - 1)) == 0,
                   "FFT size must be a power of two >= 32");
 
@@ -285,8 +282,9 @@ public:
 
     // The calculate() overloads copy `size` samples in, zero-pad to N,
     // window, transform, and scale. Zero-padding keeps bin spacing at
-    // sampleRate/N, but the amplitude scaling assumes a full buffer, so
-    // partial captures read low by size/N. Raw unipolar ADC data carries a
+    // sampleRate/N. Set the window for the actual sample count to normalize
+    // that capture; the default unwindowed scale reads partial captures low
+    // by size/N. Raw unipolar ADC data carries a
     // large DC offset that lands in bin 0 — peakBin() skips it by default,
     // or call removeDC() on a float copy first for a clean spectrum.
     void calculate(uint16_t* source, int size = N) {
@@ -321,8 +319,8 @@ public:
         // time-domain amplitude in the output (same units as the input).
         // windowSum_ is the sum of the FIRST HALF of the window = (sum of
         // all N coefficients)/2, so dividing by it is the textbook
-        // single-sided correction 2/sum(w): the factor 2 recovers the energy
-        // of the discarded negative frequencies, and sum(w) undoes the
+        // single-sided correction 2/sum(w): the factor 2 accounts for the
+        // matching negative-frequency component, and sum(w) undoes the
         // window's coherent gain. With no window set, windowSum_ falls back
         // to N/2 (rectangle sum / 2).
         if (windowSum_ == 0.0f) windowSum_ = (float)(N / 2);
@@ -349,8 +347,9 @@ public:
     // Convert result[0..N/2] in place from linear magnitude to dB relative
     // to full scale: 20*log10(mag / maxScale). The default maxScale = 32767
     // assumes int16-scale samples; pass 1.0f for normalized float input, or
-    // 4095.0f for a 12-bit ADC — otherwise every reading is offset by a
-    // constant dB. Output is clamped to [floor, +10]: the floor tames
+    // approximately 2048.0f for a full-scale sine centered in a 12-bit ADC
+    // range. maxScale is peak amplitude in input units; a wrong value adds a
+    // constant dB offset. Output is clamped to [floor, +10]: the floor tames
     // log10(0) = -inf on empty bins, the +10 dB ceiling absorbs slight
     // overshoot (windowing/rounding) above full scale. Linear magnitudes
     // are destroyed — call peakBin()/SINAD()/ENOB() first if you need them.
@@ -377,9 +376,8 @@ public:
     }
 
     // Frequency of the dominant bin in Hz for a given capture sample rate.
-    // Resolution is one bin = sampleRate / N, so the true tone is within
-    // +/- half a bin of the returned value; interpolate around peakBin()
-    // if you need finer estimates.
+    // Bin spacing is sampleRate / N. This returns a bin center without
+    // interpolation; noise and nearby tones can affect which bin is largest.
     float peakFrequency(float sampleRate, bool skipDC = true) {
         return (float)peakBin(skipDC) * sampleRate / (float)N;
     }
@@ -404,7 +402,7 @@ private:
 // cannot fail to allocate.
 //
 // Memory: buffers live on the heap — samples N + result N + window N/2 +
-// twiddles N/4 + 1 = 2.75 * N floats (11 * N bytes) per init(), re-allocated
+// twiddles N/4 + 1, approximately 2.75 * N floats (11 * N bytes), re-allocated
 // on every call: 4096 -> 44 kB, 16384 -> 176 kB, 32768 -> 352 kB. Nothing is
 // allocated until the first init(), and calculate()/forward() are safe
 // no-ops before it. There is no size cap beyond what the heap holds.
@@ -430,11 +428,8 @@ public:
             return false;
         }
 
-        // nothrow, and zero only AFTER the null check: with -fno-exceptions
-        // a failed plain new[] returns nullptr, and the value-init form
-        // `new float[n]()` zero-fills through that nullptr before any check
-        // can run — on a heap-tight build that is a hard fault (nullptr
-        // DACCVIOL + reboot), not the promised false return.
+        // Report allocation failure through init()'s false return. Clear the
+        // buffers only after all allocations have succeeded.
         samples_    = new (std::nothrow) float[size];
         result_     = new (std::nothrow) float[size];
         windowCoef_ = new (std::nothrow) float[size / 2];
@@ -536,10 +531,8 @@ public:
 
     // Convert result[0..size/2] in place from linear magnitude to dB, as
     // FFT<N>::postScaleDB() does, with one addition: the clamp ceiling is a
-    // parameter. Boards whose ADC full scale sits above the display
-    // reference need a ceiling other than +10 dB (e.g. +10.37 dBV for a
-    // 3.3 Vpp ADC against a 1.0 Vpp reference, 0 dBV when full scale equals
-    // the reference).
+    // parameter. Set it high enough to retain levels above maxScale. Both
+    // the spectrum and maxScale must use the same amplitude units.
     void postScaleDB(float floor = -100.0f, float maxScale = 32767.0f, float ceiling = 10.0f) {
         if (!result_) return;
         for (int i = 0; i <= (size_ / 2); i++) {

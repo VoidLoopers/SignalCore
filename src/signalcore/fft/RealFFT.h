@@ -2,10 +2,8 @@
  * @file RealFFT.h
  * @brief Real-input FFT engine, float or double, any power of two >= 32.
  *
- * RealFFT<T> transforms n real samples into the n/2 + 1 complex bins of
- * their spectrum. It is the one transform every SignalCore class runs on:
- * FFT<N> and DynamicFFT wrap RealFFT<float>, and measure/SineMetrics.h
- * runs its bin powers through RealFFT<SpectrumReal>.
+ * RealFFT<T> transforms n real samples into n/2 + 1 complex frequency bins.
+ * Bin k represents frequency k * sampleRate / n.
  *
  * Two backends, chosen per instance by init():
  *
@@ -19,19 +17,11 @@
  * Both give the same output packing (below), so a caller never needs to
  * know which one ran; backend() reports it for diagnostics.
  *
- * Twiddles come from a quarter-wave table of n/4 + 1 values, sin(2 pi k / n)
- * for k = 0..n/4, computed in double and stored as T. Cosines are the same
- * table read from the other end. The table is the engine's only memory,
- * either allocated by init(n) or supplied by the caller through
- * init(n, table, count) for code that must not allocate. The precomputed-
- * table design follows Robin Scheibler's ESP32 FFT (MIT, 2017); the code
- * here is written fresh.
- *
- * Precision: the transform runs entirely in T. With table twiddles a float
- * transform has a round-off floor near -150 dBFS per bin at 8192 points
- * (test/host/test_realfft.cpp prints the measured figure), far below any
- * converter up to about 18 effective bits. RealFFT<double> exists for the
- * 20-bit class.
+ * Twiddles are sine/cosine factors used to combine FFT stages. A quarter-
+ * wave table stores n/4 + 1 sine values; symmetry supplies the other values.
+ * init(n) allocates the table, or init(n, table, count) uses caller storage.
+ * Table values are computed in double and stored as T; the transform uses T.
+ * Table design inspired by Robin Scheibler's ESP32 FFT (MIT, 2017).
  *
  * Output packing (the CMSIS arm_rfft_fast_f32 layout):
  *   out[0]              DC, real
@@ -44,7 +34,7 @@
  * FFT<N> keeps its compile-time cap (SIGNALCORE_MAX_FFT_SIZE) because its
  * buffers are static; the runtime classes are limited by memory alone.
  *
- * Platform: Any Arduino-compatible board, and the host test rig.
+ * Platform: Arduino-compatible boards and desktop C++ builds.
  *
  *   This file is a part of the SignalCore project, a cross-platform digital
  *   signal processing toolkit released by VoidLoop. See www.voidloop.com for
@@ -184,10 +174,8 @@ public:
     // Which engine forward() runs.
     Backend backend() const { return backend_; }
 
-    // For tests only: run the generic engine even where CMSIS would apply,
-    // so the two can be compared bin for bin on hardware. Takes effect on
-    // the next forward(); the table is always built, so it may be called
-    // after init().
+    // Select the generic backend when on; otherwise use CMSIS if available.
+    // Takes effect on the next forward() and can be changed after init().
     void forceGeneric(bool on) {
         forceGeneric_ = on;
         if (n_ == 0) return;
@@ -244,7 +232,8 @@ private:
         const uint32_t m = n / 2;
         memcpy(out, in, (size_t)n * sizeof(T));
 
-        // Bit-reversal permutation of the m complex points.
+        // Reorder points by reversing their index bits so each butterfly
+        // stage can combine adjacent groups in place.
         for (uint32_t i = 1, j = 0; i < m; ++i) {
             uint32_t bit = m >> 1;
             for (; j & bit; bit >>= 1) j ^= bit;
@@ -256,7 +245,8 @@ private:
             }
         }
 
-        // Butterfly stages. A butterfly at offset j in a group of `len`
+        // Each butterfly combines two values into their sum and difference
+        // after rotating one by a twiddle. Offset j in a group of `len`
         // points uses W_len^j = exp(-2 pi i j / len), which is angle index
         // j * (n / len) in the n-point table.
         for (uint32_t len = 2; len <= m; len <<= 1) {
